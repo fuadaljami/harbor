@@ -71,6 +71,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.manage(shell);
             app.manage(coord);
 
+            let main_cfg = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .ok_or_else(|| {
+                    crate::error::AppError::Window("Missing 'main' window config".to_owned())
+                })?
+                .clone();
+            let mut win_builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &main_cfg)?;
+            if let Some(webview2_dir) = &paths.webview2_dir {
+                win_builder = win_builder.data_directory(webview2_dir.clone());
+            }
+            win_builder.build()?;
+
             setup_tray(app.handle())?;
             register_initial_hotkey(app.handle());
 
@@ -81,6 +97,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 portable = paths.is_portable,
                 data_dir = %paths.data_dir.display(),
+                webview2_dir = ?paths.webview2_dir,
                 "Harbor initialized"
             );
             Ok(())

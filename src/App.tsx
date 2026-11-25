@@ -736,8 +736,12 @@ export default function App() {
   const expandedContent = (
     <DockBoundsProvider value={getDockHorizontalBounds}>
       <div
-        style={{ height: `${Math.round(layout.dock_height)}px` }}
-        className={`w-[404px] flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-transparent overflow-hidden`}
+        style={
+          inBrowserPreview
+            ? { height: `${Math.round(layout.dock_height)}px` }
+            : undefined
+        }
+        className={`w-[404px] ${inBrowserPreview ? "" : "h-full"} flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-transparent overflow-hidden`}
       >
         <div
           onTransitionEnd={(e) => {
@@ -756,7 +760,7 @@ export default function App() {
         >
           <div
             ref={dockShellRef}
-            className={`relative w-[380px] h-full flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-harbor-rail border border-[#1F2023] rounded-[12px] overflow-hidden shadow-2xl`}
+            className={`relative w-[380px] h-full flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-[#1E1F22] border border-[#1F2023] rounded-[12px] overflow-hidden`}
           >
             <CategoryRail
               edge={layout.edge}
@@ -769,7 +773,7 @@ export default function App() {
               }}
             />
 
-            <div className="flex-1 min-w-0 h-full flex flex-col relative bg-harbor-panel">
+            <div className="flex-1 h-full bg-[#2B2D31] flex flex-col min-w-0 relative">
               <DockHeader
                 selectedCategory={selectedCategory}
                 itemCount={counts[selectedCategory]}

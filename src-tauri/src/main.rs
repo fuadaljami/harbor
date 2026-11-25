@@ -3,7 +3,7 @@
 
 fn main() {
     if let Err(err) = harbor_lib::run() {
-        eprintln!("Harbor failed to start: {err}");
+        harbor_lib::win_shell::report_fatal_startup_error(&*err);
         std::process::exit(1);
     }
 }

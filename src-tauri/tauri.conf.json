@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "Harbor",
+        "create": false,
         "width": 380,
         "height": 640,
         "decorations": false,
@@ -36,12 +37,21 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "publisher": "Harbor",
+    "copyright": "Copyright (c) 2026 Harbor",
+    "shortDescription": "Ultra-lightweight Windows edge-docking launcher",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "nsis/hooks.nsh"
+      }
+    }
   }
 }

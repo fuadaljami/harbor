@@ -44,11 +44,12 @@ use windows::Win32::UI::Shell::{
     SHGFI_LARGEICON, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, GetCursorPos, GetForegroundWindow, GetIconInfo, GetSystemMetrics, SetWindowPos,
-    HICON, ICONINFO, SM_SWAPBUTTON, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNORMAL,
+    DestroyIcon, GetCursorPos, GetForegroundWindow, GetIconInfo, GetSystemMetrics, MessageBoxW,
+    SetWindowPos, HICON, ICONINFO, MB_ICONERROR, MB_OK, SM_SWAPBUTTON, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL,
 };
 
+use crate::config::AppPaths;
 use crate::error::{AppError, AppResult};
 use crate::models::normalize_path_key;
 
@@ -112,6 +113,7 @@ struct ComGuard {
 
 impl ComGuard {
     fn initialize(coinit_flags: windows::Win32::System::Com::COINIT) -> AppResult<Self> {
+        // SAFETY: Initializes COM apartment state once for the current dedicated OS worker thread.
         let hr = unsafe { CoInitializeEx(None, coinit_flags) };
         if hr.is_err() {
             return Err(AppError::Shell(format!(
@@ -126,6 +128,7 @@ impl ComGuard {
 impl Drop for ComGuard {
     fn drop(&mut self) {
         if self.initialized {
+            // SAFETY: Balances the successful `CoInitializeEx` on this exact worker thread.
             unsafe {
                 CoUninitialize();
             }
@@ -153,6 +156,7 @@ impl OwnedHbitmap {
 impl Drop for OwnedHbitmap {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: Releases the owned GDI bitmap handle exactly once after validity check.
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(self.0 .0));
             }
@@ -185,6 +189,7 @@ impl OwnedHrgn {
 impl Drop for OwnedHrgn {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: Deletes an owned GDI region handle that was not transferred to `SetWindowRgn`.
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(self.0 .0));
             }
@@ -212,6 +217,7 @@ impl OwnedHicon {
 impl Drop for OwnedHicon {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: Destroys the owned Win32 icon handle obtained from `SHGetFileInfoW`.
             unsafe {
                 let _ = DestroyIcon(self.0);
             }
@@ -224,6 +230,7 @@ struct OwnedScreenDc(HDC);
 
 impl OwnedScreenDc {
     fn acquire_screen() -> AppResult<Self> {
+        // SAFETY: Acquires a display device context for the entire virtual screen; checked below.
         let hdc = unsafe { GetDC(None) };
         if hdc.is_invalid() {
             return Err(AppError::Shell("GetDC(None) returned null handle".to_owned()));
@@ -239,6 +246,7 @@ impl OwnedScreenDc {
 impl Drop for OwnedScreenDc {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: Releases the screen DC acquired in `acquire_screen`.
             unsafe {
                 let _ = ReleaseDC(None, self.0);
             }
@@ -258,6 +266,7 @@ impl OwnedHkey {
 impl Drop for OwnedHkey {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: Closes an open Win32 registry key handle owned by this guard.
             unsafe {
                 let _ = RegCloseKey(self.0);
             }
@@ -271,6 +280,7 @@ struct CoTaskMemPwstr(PWSTR);
 impl Drop for CoTaskMemPwstr {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: Frees a valid COM task-allocated buffer returned by `SHGetKnownFolderPath`.
             unsafe {
                 CoTaskMemFree(Some(self.0 .0.cast()));
             }
@@ -578,6 +588,7 @@ pub fn is_drive_local_and_available(path: &Path) -> bool {
         return false;
     };
     let wide = to_wide_null(&root);
+    // SAFETY: `wide` is a null-terminated UTF-16 drive root string alive across the Win32 call.
     let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
     match drive_type {
         DRIVE_FIXED | DRIVE_RAMDISK => true,
@@ -595,6 +606,7 @@ pub fn is_drive_mounted(path: &Path) -> bool {
     }
     if let Some(root) = extract_drive_root(path) {
         let wide = to_wide_null(&root);
+        // SAFETY: `wide` is a null-terminated UTF-16 drive root string alive across the call.
         let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
         drive_type != DRIVE_UNKNOWN && drive_type != DRIVE_NO_ROOT_DIR
     } else {
@@ -829,10 +841,12 @@ fn write_rgba_png_atomic(target: &Path, img: &RgbaImage) -> AppResult<()> {
 }
 
 fn extract_via_image_factory(wide_path: &[u16]) -> AppResult<Option<(u32, u32, Vec<u8>)>> {
+    // SAFETY: Runs on the STA worker after COM init; `wide_path` is null-terminated UTF-16.
     let factory: IShellItemImageFactory =
         unsafe { SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None) }
             .map_err(|err| AppError::Shell(format!("SHCreateItemFromParsingName failed: {err}")))?;
 
+    // SAFETY: `factory` is a valid STA COM pointer and `SIZE` is a plain value struct.
     let hbmp_raw = unsafe {
         factory.GetImage(
             SIZE {
@@ -853,6 +867,7 @@ fn extract_via_image_factory(wide_path: &[u16]) -> AppResult<Option<(u32, u32, V
 
 fn extract_via_shgetfileinfo(wide_path: &[u16]) -> AppResult<Option<(u32, u32, Vec<u8>)>> {
     let mut shfi = SHFILEINFOW::default();
+    // SAFETY: `wide_path` is null-terminated UTF-16 and `shfi` is properly sized & aligned.
     let res = unsafe {
         SHGetFileInfoW(
             PCWSTR(wide_path.as_ptr()),
@@ -868,6 +883,7 @@ fn extract_via_shgetfileinfo(wide_path: &[u16]) -> AppResult<Option<(u32, u32, V
     }
 
     let mut icon_info = ICONINFO::default();
+    // SAFETY: `hicon` is validated non-null above and `icon_info` is valid out-param memory.
     unsafe { GetIconInfo(hicon.as_raw(), &mut icon_info) }
         .map_err(|err| AppError::Shell(format!("GetIconInfo failed: {err}")))?;
 
@@ -884,6 +900,7 @@ fn extract_via_shgetfileinfo(wide_path: &[u16]) -> AppResult<Option<(u32, u32, V
 
 fn extract_hbitmap_rgba(hbitmap: HBITMAP) -> AppResult<Option<(u32, u32, Vec<u8>)>> {
     let mut bmp = BITMAP::default();
+    // SAFETY: `bmp` has exact `size_of::<BITMAP>()` bytes reserved on stack for `GetObjectW`.
     let obj_bytes = unsafe {
         GetObjectW(
             HGDIOBJ(hbitmap.0),
@@ -921,6 +938,7 @@ fn extract_hbitmap_rgba(hbitmap: HBITMAP) -> AppResult<Option<(u32, u32, Vec<u8>
     };
 
     let screen_dc = OwnedScreenDc::acquire_screen()?;
+    // SAFETY: `bgra` is allocated to exact `width * height * 4` 32bpp scanline byte length.
     let scanlines = unsafe {
         GetDIBits(
             screen_dc.as_raw(),
@@ -946,6 +964,7 @@ fn resolve_lnk_sync(lnk_path: &Path) -> AppResult<Option<ResolvedLnk>> {
         return Ok(None);
     }
 
+    // SAFETY: Instantiates standard ShellLink CLSID inside the initialized STA COM thread.
     let shell_link: IShellLinkW = unsafe {
         CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
     }
@@ -955,11 +974,13 @@ fn resolve_lnk_sync(lnk_path: &Path) -> AppResult<Option<ResolvedLnk>> {
         .map_err(|err| AppError::Shell(format!("QueryInterface(IPersistFile) failed: {err}")))?;
 
     let wide_lnk = to_wide_null(&lnk_path.to_string_lossy());
+    // SAFETY: `wide_lnk` is a null-terminated UTF-16 path string alive across `Load`.
     if unsafe { persist.Load(PCWSTR(wide_lnk.as_ptr()), STGM_READ) }.is_err() {
         return Ok(None);
     }
 
     let mut target_buf = [0_u16; 1024];
+    // SAFETY: `target_buf` provides a writable 1024-u16 buffer; optional WIN32_FIND_DATAW is null.
     if unsafe { shell_link.GetPath(&mut target_buf, std::ptr::null_mut(), 0) }.is_err() {
         return Ok(None);
     }
@@ -969,6 +990,7 @@ fn resolve_lnk_sync(lnk_path: &Path) -> AppResult<Option<ResolvedLnk>> {
     }
 
     let mut args_buf = [0_u16; 1024];
+    // SAFETY: `args_buf` is a writable stack slice sized for ShellLink argument output.
     let arguments = if unsafe { shell_link.GetArguments(&mut args_buf) }.is_ok() {
         from_wide_null_terminated(&args_buf).trim().to_owned()
     } else {
@@ -976,6 +998,7 @@ fn resolve_lnk_sync(lnk_path: &Path) -> AppResult<Option<ResolvedLnk>> {
     };
 
     let mut desc_buf = [0_u16; 512];
+    // SAFETY: `desc_buf` is a writable stack slice sized for ShellLink description output.
     let description = if unsafe { shell_link.GetDescription(&mut desc_buf) }.is_ok() {
         from_wide_null_terminated(&desc_buf).trim().to_owned()
     } else {
@@ -1031,6 +1054,7 @@ fn launch_target_sync(target: &str, arguments: &str, run_as_admin: bool) -> AppR
         ..Default::default()
     };
 
+    // SAFETY: `sei` fields point solely to UTF-16 buffers pinned in stack locals for the call duration.
     if let Err(err) = unsafe { ShellExecuteExW(&mut sei) } {
         if err.code() == HRESULT_ERROR_CANCELLED {
             return Err(AppError::LaunchCancelled);
@@ -1063,6 +1087,7 @@ fn open_file_location_sync(target: &str) -> AppResult<()> {
 
 /// Locks the Windows workstation via Win32 `LockWorkStation()`.
 pub fn lock_workstation() -> AppResult<()> {
+    // SAFETY: `LockWorkStation` takes no pointers or shared state.
     unsafe { LockWorkStation() }
         .map_err(|err| AppError::Shell(format!("LockWorkStation failed: {err}")))
 }
@@ -1070,6 +1095,7 @@ pub fn lock_workstation() -> AppResult<()> {
 /// Queries the current cursor screen coordinates in physical pixels via `GetCursorPos`.
 pub fn get_cursor_pos() -> AppResult<(i32, i32)> {
     let mut pt = POINT::default();
+    // SAFETY: `pt` is a properly initialized stack `POINT` passed by mutable pointer.
     unsafe { GetCursorPos(&mut pt) }
         .map_err(|err| AppError::Window(format!("GetCursorPos failed: {err}")))?;
     Ok((pt.x, pt.y))
@@ -1077,11 +1103,13 @@ pub fn get_cursor_pos() -> AppResult<(i32, i32)> {
 
 /// Queries the work-area rectangle (`rcWork`) of the monitor nearest `(x, y)` via `GetMonitorInfoW`.
 pub fn get_monitor_work_area_at(x: i32, y: i32) -> AppResult<Win32Rect> {
+    // SAFETY: Pure query returning a monitor handle or fallback nearest monitor.
     let hmonitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
+    // SAFETY: `info.cbSize` equals `size_of::<MONITORINFO>()` and `info` is valid out-param memory.
     let ok = unsafe { GetMonitorInfoW(hmonitor, &mut info) };
     if !ok.as_bool() {
         return Err(AppError::Window("GetMonitorInfoW failed".to_owned()));
@@ -1103,8 +1131,10 @@ pub fn get_monitor_work_area_at(x: i32, y: i32) -> AppResult<Win32Rect> {
 /// Checks whether the logical primary mouse button is currently pressed (honoring `SM_SWAPBUTTON`).
 #[must_use]
 pub fn is_primary_mouse_button_down() -> bool {
+    // SAFETY: Pure Win32 system metric / asynchronous key state queries with no pointers.
     let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
     let vk = if swapped { VK_RBUTTON.0 } else { VK_LBUTTON.0 };
+    // SAFETY: Queries bit state for a valid Win32 virtual key constant.
     let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
     (state as u16 & 0x8000) != 0
 }
@@ -1112,6 +1142,7 @@ pub fn is_primary_mouse_button_down() -> bool {
 /// Moves a window without resizing, activating, or blocking the calling thread.
 pub fn move_window_no_resize_async(hwnd_raw: isize, x: i32, y: i32) -> AppResult<()> {
     let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    // SAFETY: `hwnd` refers to the app's own live `HWND` and flags avoid sizing/activation.
     unsafe {
         SetWindowPos(
             hwnd,
@@ -1129,6 +1160,7 @@ pub fn move_window_no_resize_async(hwnd_raw: isize, x: i32, y: i32) -> AppResult
 /// Checks whether `hwnd_raw` is currently the active Win32 foreground window.
 #[must_use]
 pub fn is_window_foreground(hwnd_raw: isize) -> bool {
+    // SAFETY: Thread-safe Win32 foreground handle read compared numerically against `hwnd_raw`.
     unsafe { GetForegroundWindow() }.0 as isize == hwnd_raw
 }
 
@@ -1139,6 +1171,7 @@ pub fn set_window_region_union(
     dock_rect: (i32, i32, i32, i32),
     handle_rect: (i32, i32, i32, i32),
 ) -> AppResult<()> {
+    // SAFETY: Creates rectangular GDI regions immediately wrapped in RAII `OwnedHrgn` guards.
     let dock_rgn = OwnedHrgn::new(unsafe {
         CreateRectRgn(dock_rect.0, dock_rect.1, dock_rect.2, dock_rect.3)
     });
@@ -1146,6 +1179,7 @@ pub fn set_window_region_union(
         return Err(AppError::Window("CreateRectRgn(dock) returned null".to_owned()));
     }
 
+    // SAFETY: Creates handle GDI region wrapped in `OwnedHrgn`.
     let handle_rgn = OwnedHrgn::new(unsafe {
         CreateRectRgn(handle_rect.0, handle_rect.1, handle_rect.2, handle_rect.3)
     });
@@ -1153,6 +1187,7 @@ pub fn set_window_region_union(
         return Err(AppError::Window("CreateRectRgn(handle) returned null".to_owned()));
     }
 
+    // SAFETY: Creates destination GDI region wrapped in `OwnedHrgn`.
     let mut combined_rgn = OwnedHrgn::new(unsafe { CreateRectRgn(0, 0, 0, 0) });
     if !combined_rgn.is_valid() {
         return Err(AppError::Window(
@@ -1160,6 +1195,7 @@ pub fn set_window_region_union(
         ));
     }
 
+    // SAFETY: All three HRGN handles were validated non-null immediately above.
     let combine_res = unsafe {
         CombineRgn(
             Some(combined_rgn.as_raw()),
@@ -1173,6 +1209,7 @@ pub fn set_window_region_union(
     }
 
     let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    // SAFETY: Executed synchronously on the UI main thread with a valid `HWND` and valid `HRGN`.
     let set_res = unsafe { SetWindowRgn(hwnd, Some(combined_rgn.as_raw()), true) };
     if set_res == 0 {
         return Err(AppError::Window("SetWindowRgn(combined) failed".to_owned()));
@@ -1187,11 +1224,42 @@ pub fn set_window_region_union(
 /// Must be called on the UI/main thread.
 pub fn clear_window_region(hwnd_raw: isize) -> AppResult<()> {
     let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    // SAFETY: Executed on the UI main thread; passing `None` clears the HWND region safely.
     let set_res = unsafe { SetWindowRgn(hwnd, None, true) };
     if set_res == 0 {
         tracing::debug!("SetWindowRgn(None) returned 0 (no active region or window closing)");
     }
     Ok(())
+}
+
+/// Persists a fatal startup error to the log directory (or temp fallback) and displays a
+/// single native error dialog so release GUI builds (`windows_subsystem = "windows"`) do not
+/// silently exit without diagnostics.
+pub fn report_fatal_startup_error(err: &dyn std::fmt::Display) {
+    let message = format!("Harbor failed to start:\n\n{err}");
+    tracing::error!(error = %err, "Fatal startup error");
+
+    let log_dir = AppPaths::resolve()
+        .map(|p| p.logs_dir)
+        .unwrap_or_else(|_| std::env::temp_dir().join("Harbor"));
+    if std::fs::create_dir_all(&log_dir).is_ok() {
+        let log_path = log_dir.join("harbor-startup.log");
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(file, "Fatal startup error: {err}");
+        }
+    }
+
+    let title_wide = to_wide_null("Harbor Startup Error");
+    let body_wide = to_wide_null(&message);
+    // SAFETY: Both pointers reference null-terminated UTF-16 buffers valid for the call duration.
+    let _ = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        )
+    };
 }
 
 /// Enables or disables starting Harbor with Windows via `HKCU\...\Run`.
@@ -1200,6 +1268,7 @@ pub fn set_start_with_windows(enabled: bool) -> AppResult<()> {
     let value_wide = to_wide_null(STARTUP_VALUE_NAME);
 
     let mut raw_hkey = HKEY::default();
+    // SAFETY: `subkey_wide` is null-terminated UTF-16 and `raw_hkey` receives the opened HKEY.
     let create_err = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -1227,9 +1296,12 @@ pub fn set_start_with_windows(enabled: bool) -> AppResult<()> {
         })?;
         let quoted = format!("\"{}\"", exe_path.display());
         let wide_val = to_wide_null(&quoted);
+        // SAFETY: `wide_val` is a contiguous `[u16]` slice (`align_of::<u8>() <= align_of::<u16>()`),
+        // so viewing `wide_val.len() * 2` initialized bytes as `&[u8]` is sound.
         let bytes = unsafe {
             std::slice::from_raw_parts(wide_val.as_ptr().cast::<u8>(), wide_val.len() * 2)
         };
+        // SAFETY: Registry handle `key` is valid for `KEY_SET_VALUE`, and `value_wide` & `bytes` are valid.
         let set_err = unsafe {
             RegSetValueExW(
                 key.as_raw(),
@@ -1246,6 +1318,7 @@ pub fn set_start_with_windows(enabled: bool) -> AppResult<()> {
             )));
         }
     } else {
+        // SAFETY: `key` is valid for `KEY_SET_VALUE` and `value_wide` is null-terminated UTF-16.
         let del_err = unsafe { RegDeleteValueW(key.as_raw(), PCWSTR(value_wide.as_ptr())) };
         if del_err.0 != 0 && del_err != ERROR_FILE_NOT_FOUND {
             return Err(AppError::Shell(format!(
@@ -1263,6 +1336,7 @@ pub fn set_start_with_windows(enabled: bool) -> AppResult<()> {
 pub fn read_steam_install_path() -> Option<PathBuf> {
     let subkey = to_wide_null(STEAM_REG_SUBKEY);
     let mut raw_hkey = HKEY::default();
+    // SAFETY: `subkey` is null-terminated UTF-16 and `raw_hkey` receives the opened read-only HKEY.
     let open_err = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -1297,6 +1371,7 @@ fn read_registry_sz(hkey: HKEY, value_name: &str) -> Option<String> {
     let name_wide = to_wide_null(value_name);
     let mut reg_type = REG_VALUE_TYPE::default();
     let mut byte_len = 0_u32;
+    // SAFETY: First call passes `None` for the data buffer to query required byte length only.
     let query_size = unsafe {
         RegQueryValueExW(
             hkey,
@@ -1312,6 +1387,7 @@ fn read_registry_sz(hkey: HKEY, value_name: &str) -> Option<String> {
     }
 
     let mut buf = vec![0_u8; byte_len as usize];
+    // SAFETY: `buf` holds at least `byte_len` writable bytes for `RegQueryValueExW`.
     let query_data = unsafe {
         RegQueryValueExW(
             hkey,
@@ -1346,9 +1422,11 @@ fn read_registry_sz(hkey: HKEY, value_name: &str) -> Option<String> {
 pub fn resolve_start_menu_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for folder_id in [&FOLDERID_Programs, &FOLDERID_CommonPrograms] {
+        // SAFETY: Standard known-folder GUID reference; returned PWSTR is freed by `CoTaskMemPwstr`.
         if let Ok(raw_pwstr) = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None) } {
             let guard = CoTaskMemPwstr(raw_pwstr);
             if !guard.0.is_null() {
+                // SAFETY: `guard.0` is non-null COM-allocated null-terminated UTF-16 from `SHGetKnownFolderPath`.
                 if let Ok(path_str) = unsafe { guard.0.to_string() } {
                     let candidate = PathBuf::from(path_str);
                     if candidate.is_dir() && !dirs.contains(&candidate) {

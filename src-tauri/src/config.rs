@@ -22,6 +22,7 @@ pub struct AppPaths {
     pub config_path: PathBuf,
     pub logs_dir: PathBuf,
     pub icon_cache_dir: PathBuf,
+    pub webview2_dir: Option<PathBuf>,
 }
 
 impl AppPaths {
@@ -54,20 +55,30 @@ impl AppPaths {
             base.join("Harbor")
         };
 
+        let webview2_dir = if is_portable {
+            Some(data_dir.join("webview2"))
+        } else {
+            None
+        };
+
         Ok(Self {
             is_portable,
             config_path: data_dir.join("config.json"),
             logs_dir: data_dir.join("logs"),
             icon_cache_dir: data_dir.join("icon_cache"),
+            webview2_dir,
             data_dir,
         })
     }
 
-    /// Creates `data_dir`, `logs_dir`, and `icon_cache_dir` if they do not already exist.
+    /// Creates `data_dir`, `logs_dir`, `icon_cache_dir`, and portable `webview2_dir` if missing.
     pub fn ensure_dirs(&self) -> AppResult<()> {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.logs_dir)?;
         std::fs::create_dir_all(&self.icon_cache_dir)?;
+        if let Some(webview2_dir) = &self.webview2_dir {
+            std::fs::create_dir_all(webview2_dir)?;
+        }
         Ok(())
     }
 }
@@ -363,6 +374,7 @@ mod tests {
             installed.icon_cache_dir,
             local_app_data.join("Harbor/icon_cache")
         );
+        assert!(installed.webview2_dir.is_none());
 
         // With portable.flag -> Portable mode in <exe_dir>\data.
         std::fs::write(exe_dir.join("portable.flag"), b"")?;
@@ -370,6 +382,7 @@ mod tests {
         assert!(portable.is_portable);
         assert_eq!(portable.data_dir, exe_dir.join("data"));
         assert_eq!(portable.config_path, exe_dir.join("data/config.json"));
+        assert_eq!(portable.webview2_dir, Some(exe_dir.join("data/webview2")));
 
         let _ = std::fs::remove_dir_all(&root);
         Ok(())

@@ -36,10 +36,10 @@ export function CategoryRail({
   return (
     <nav
       aria-label="Shortcut categories"
-      className={`w-[56px] shrink-0 h-full bg-harbor-rail py-2.5 flex flex-col items-center gap-2 ${
+      className={`w-[56px] h-full bg-[#1E1F22] shrink-0 py-2.5 flex flex-col items-center gap-2 ${
         isRight
-          ? "border-l border-harbor-border"
-          : "border-r border-harbor-border"
+          ? "border-l border-[#1F2023]"
+          : "border-r border-[#1F2023]"
       }`}
     >
       {RAIL_ITEMS.map(({ id, label, Icon }) => {
