@@ -14,7 +14,10 @@ import {
   type ToastVariant,
 } from "./components/ToastContainer";
 import { useIconStore } from "./hooks/useIconStore";
+import { useKeyboardNav } from "./hooks/useKeyboardNav";
+import { DockBoundsProvider, type DockHorizontalBounds } from "./lib/dockBounds";
 import { ipc, isTauriRuntime, parseAppError } from "./lib/ipc";
+import { getVisibleShortcutIds } from "./lib/keyboard";
 import type {
   Category,
   DockConfig,
@@ -60,6 +63,13 @@ export default function App() {
 
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [focusedItemId, setFocusedItemId] = useState<string | null>(null);
+  const [collapsedSections, setCollapsedSections] = useState<
+    Record<Category, boolean>
+  >({
+    Games: false,
+    Apps: false,
+    Tools: false,
+  });
   const [isRescanning, setIsRescanning] = useState<boolean>(false);
   const [isDropHover, setIsDropHover] = useState<boolean>(false);
 
@@ -70,8 +80,10 @@ export default function App() {
   const [addEditOpen, setAddEditOpen] = useState<boolean>(false);
   const [editingItem, setEditingItem] = useState<DockItem | null>(null);
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
+  const [hotkeyRecording, setHotkeyRecording] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
+  const dockShellRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const listScrollRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -589,19 +601,83 @@ export default function App() {
     pushToast("success", "Restored discovered defaults");
   }, [pushToast]);
 
-  // Basic Ctrl+K shortcut in Phase 4 (full keyboard traversal added in Phase 5).
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!layout?.expanded) return;
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select();
+  const handleToggleSection = useCallback((category: Category) => {
+    setCollapsedSections((prev) => ({
+      ...prev,
+      [category]: !prev[category],
+    }));
+  }, []);
+
+  const itemsById = useMemo(() => {
+    const map = new Map<string, DockItem>();
+    for (const item of config?.items ?? []) {
+      map.set(item.id, item);
+    }
+    return map;
+  }, [config?.items]);
+
+  const visibleShortcutIds = useMemo(
+    () =>
+      getVisibleShortcutIds(
+        config?.items ?? [],
+        selectedCategory,
+        searchQuery,
+        collapsedSections,
+      ),
+    [config?.items, selectedCategory, searchQuery, collapsedSections],
+  );
+
+  const handleCloseActiveModal = useCallback(() => {
+    if (addEditOpen) {
+      setAddEditOpen(false);
+      setEditingItem(null);
+    } else if (settingsOpen) {
+      setSettingsOpen(false);
+    }
+  }, [addEditOpen, settingsOpen]);
+
+  const handleClearSearch = useCallback(() => {
+    setSearchQuery("");
+    setFocusedItemId(null);
+  }, []);
+
+  useKeyboardNav({
+    expanded: Boolean(layout?.expanded),
+    isClosing,
+    itemsById,
+    visibleIds: visibleShortcutIds,
+    highlightedId: focusedItemId,
+    selectedCategory,
+    searchQuery,
+    modalOpen: addEditOpen || settingsOpen,
+    contextMenuOpen: contextMenu !== null,
+    hotkeyRecorderActive: hotkeyRecording,
+    searchInputRef,
+    cardRefs,
+    onHighlightChange: setFocusedItemId,
+    onSelectCategory: (cat) => void handleSelectCategory(cat),
+    onClearSearch: handleClearSearch,
+    onCollapseDock: () => void handleRequestCollapse(),
+    onCloseContextMenu: () => setContextMenu(null),
+    onCloseModal: handleCloseActiveModal,
+    onLaunchItem: (item, runAsAdmin) => void handleLaunch(item, runAsAdmin),
+  });
+
+  const getDockHorizontalBounds = useCallback((): DockHorizontalBounds => {
+    if (isTauriRuntime()) {
+      return layout?.edge === "Right"
+        ? { minX: 24, maxX: 404 }
+        : { minX: 0, maxX: 380 };
+    }
+    const el = dockShellRef.current;
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0) {
+        return { minX: rect.left, maxX: rect.right };
       }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [layout?.expanded]);
+    }
+    return { minX: 0, maxX: window.innerWidth };
+  }, [layout?.edge]);
 
   const contextSubgroup = useMemo(() => {
     if (!contextMenu || !config) {
@@ -657,164 +733,168 @@ export default function App() {
         ? "opacity-0 translate-x-full"
         : "opacity-0 -translate-x-full";
 
-  const dockShellRadius = isRight
-    ? "rounded-l-xl border-r-0"
-    : "rounded-r-xl border-l-0";
-
   const expandedContent = (
-    <div
-      style={{ height: `${Math.round(layout.dock_height)}px` }}
-      className={`w-[404px] flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-transparent overflow-hidden`}
-    >
+    <DockBoundsProvider value={getDockHorizontalBounds}>
       <div
-        onTransitionEnd={(e) => {
-          if (
-            e.target === e.currentTarget &&
-            (e.propertyName === "transform" || e.propertyName === "opacity") &&
-            isClosing &&
-            pendingCollapseEpochRef.current !== null
-          ) {
-            void commitCollapseOnce(pendingCollapseEpochRef.current);
-          }
-        }}
-        className={`w-[380px] h-full shrink-0 transition-[transform,opacity] ease-discord ${
-          isClosing ? "duration-[150ms]" : "duration-[160ms]"
-        } ${slideTransformClass}`}
+        style={{ height: `${Math.round(layout.dock_height)}px` }}
+        className={`w-[404px] flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-transparent overflow-hidden`}
       >
         <div
-          className={`relative w-[380px] h-full flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-harbor-panel border border-harbor-border ${dockShellRadius} overflow-hidden shadow-2xl`}
+          onTransitionEnd={(e) => {
+            if (
+              e.target === e.currentTarget &&
+              (e.propertyName === "transform" || e.propertyName === "opacity") &&
+              isClosing &&
+              pendingCollapseEpochRef.current !== null
+            ) {
+              void commitCollapseOnce(pendingCollapseEpochRef.current);
+            }
+          }}
+          className={`w-[380px] h-full shrink-0 transition-[transform,opacity] ease-discord ${
+            isClosing ? "duration-[150ms]" : "duration-[160ms]"
+          } ${slideTransformClass}`}
         >
-          <CategoryRail
-            edge={layout.edge}
-            selectedCategory={selectedCategory}
-            counts={counts}
-            onSelectCategory={(cat) => void handleSelectCategory(cat)}
-            onAddClick={() => {
-              setEditingItem(null);
-              setAddEditOpen(true);
-            }}
-          />
-
-          <div className="flex-1 min-w-0 h-full flex flex-col relative">
-            <DockHeader
-              selectedCategory={selectedCategory}
-              itemCount={counts[selectedCategory]}
-              pinned={layout.pinned}
+          <div
+            ref={dockShellRef}
+            className={`relative w-[380px] h-full flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-harbor-rail border border-[#1F2023] rounded-[12px] overflow-hidden shadow-2xl`}
+          >
+            <CategoryRail
               edge={layout.edge}
-              isRescanning={isRescanning}
-              onTogglePin={() => void handleTogglePin()}
-              onRescan={() => void handleRescan()}
-              onToggleEdge={() => void handleToggleEdge()}
-              onCollapse={() => void handleRequestCollapse()}
-            />
-
-            <SearchBar
-              query={searchQuery}
-              inputRef={searchInputRef}
-              onChange={(val) => {
-                setSearchQuery(val);
-                setFocusedItemId(null);
-              }}
-            />
-
-            <ShortcutList
-              items={config.items}
               selectedCategory={selectedCategory}
-              searchQuery={searchQuery}
-              focusedItemId={focusedItemId}
-              isDropHover={isDropHover}
-              scrollContainerRef={listScrollRef}
-              getIconUrl={getIconUrl}
-              onRequestIcon={requestIcon}
-              onLaunch={(item, admin) => void handleLaunch(item, admin)}
-              onOpenContextMenu={(item, x, y) =>
-                setContextMenu({ item, x, y })
-              }
-              onReorderGroup={(cat, pin, ids) =>
-                void handleReorderGroup(cat, pin, ids)
-              }
+              counts={counts}
+              onSelectCategory={(cat) => void handleSelectCategory(cat)}
               onAddClick={() => {
                 setEditingItem(null);
                 setAddEditOpen(true);
               }}
-              onClearSearch={() => setSearchQuery("")}
-              registerCardRef={registerCardRef}
             />
 
-            <BottomControlBar
-              expanded={layout.expanded && !isClosing}
-              hasHotkeyWarning={hotkeyWarning !== null}
-              onSystemTool={(tool) => void handleSystemTool(tool)}
-              onOpenSettings={() => setSettingsOpen(true)}
+            <div className="flex-1 min-w-0 h-full flex flex-col relative bg-harbor-panel">
+              <DockHeader
+                selectedCategory={selectedCategory}
+                itemCount={counts[selectedCategory]}
+                pinned={layout.pinned}
+                edge={layout.edge}
+                isRescanning={isRescanning}
+                onTogglePin={() => void handleTogglePin()}
+                onRescan={() => void handleRescan()}
+                onToggleEdge={() => void handleToggleEdge()}
+                onCollapse={() => void handleRequestCollapse()}
+              />
+
+              <SearchBar
+                query={searchQuery}
+                inputRef={searchInputRef}
+                onChange={(val) => {
+                  setSearchQuery(val);
+                  setFocusedItemId(null);
+                }}
+              />
+
+              <ShortcutList
+                items={config.items}
+                selectedCategory={selectedCategory}
+                searchQuery={searchQuery}
+                focusedItemId={focusedItemId}
+                collapsedSections={collapsedSections}
+                isDropHover={isDropHover}
+                scrollContainerRef={listScrollRef}
+                getIconUrl={getIconUrl}
+                onRequestIcon={requestIcon}
+                onLaunch={(item, admin) => void handleLaunch(item, admin)}
+                onOpenContextMenu={(item, x, y) =>
+                  setContextMenu({ item, x, y })
+                }
+                onReorderGroup={(cat, pin, ids) =>
+                  void handleReorderGroup(cat, pin, ids)
+                }
+                onToggleSection={handleToggleSection}
+                onAddClick={() => {
+                  setEditingItem(null);
+                  setAddEditOpen(true);
+                }}
+                onClearSearch={handleClearSearch}
+                registerCardRef={registerCardRef}
+              />
+
+              <BottomControlBar
+                expanded={layout.expanded && !isClosing}
+                hasHotkeyWarning={hotkeyWarning !== null}
+                onSystemTool={(tool) => void handleSystemTool(tool)}
+                onOpenSettings={() => setSettingsOpen(true)}
+              />
+
+              <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+            </div>
+
+            <AddEditModal
+              isOpen={addEditOpen}
+              editingItem={editingItem}
+              defaultCategory={
+                selectedCategory === "All" ? "Apps" : selectedCategory
+              }
+              onClose={() => {
+                setAddEditOpen(false);
+                setEditingItem(null);
+              }}
+              onSaveNew={handleSaveNewItem}
+              onSaveEdit={handleSaveEditItem}
             />
 
-            <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+            <SettingsModal
+              isOpen={settingsOpen}
+              config={config}
+              monitors={monitors}
+              hotkeyWarning={hotkeyWarning}
+              isPortable={isPortable}
+              isRescanning={isRescanning}
+              onClose={() => setSettingsOpen(false)}
+              onRecordingChange={setHotkeyRecording}
+              onSaveSettings={handleSaveSettings}
+              onRescan={handleRescan}
+              onDismissMissing={handleDismissMissing}
+              onResetDefaults={handleResetDefaults}
+            />
           </div>
+        </div>
 
-          <AddEditModal
-            isOpen={addEditOpen}
-            editingItem={editingItem}
-            defaultCategory={selectedCategory === "All" ? "Apps" : selectedCategory}
-            onClose={() => {
-              setAddEditOpen(false);
-              setEditingItem(null);
+        <div className="relative w-[24px] h-full shrink-0">
+          <div
+            style={{ top: `${Math.max(0, Math.round(layout.handle_offset_y))}px` }}
+            className="absolute left-0"
+          >
+            <EdgeHandle
+              expanded={true}
+              edge={layout.edge}
+              onExpand={() => void handleExpand()}
+              onCollapse={() => void handleRequestCollapse()}
+              onError={handleUnknownError}
+            />
+          </div>
+        </div>
+
+        {contextMenu && (
+          <ContextMenu
+            item={contextMenu.item}
+            x={contextMenu.x}
+            y={contextMenu.y}
+            canMoveUp={contextSubgroup.canMoveUp}
+            canMoveDown={contextSubgroup.canMoveDown}
+            onClose={() => setContextMenu(null)}
+            onLaunch={(item, admin) => void handleLaunch(item, admin)}
+            onTogglePin={(item) => void handleToggleItemPin(item)}
+            onEdit={(item) => {
+              setEditingItem(item);
+              setAddEditOpen(true);
             }}
-            onSaveNew={handleSaveNewItem}
-            onSaveEdit={handleSaveEditItem}
+            onOpenLocation={(item) => void handleOpenLocation(item)}
+            onMoveCategory={(item, cat) => void handleMoveCategory(item, cat)}
+            onMoveStep={(item, dir) => void handleMoveStep(item, dir)}
+            onRemove={(item) => void handleRemoveItem(item)}
           />
-
-          <SettingsModal
-            isOpen={settingsOpen}
-            config={config}
-            monitors={monitors}
-            hotkeyWarning={hotkeyWarning}
-            isPortable={isPortable}
-            isRescanning={isRescanning}
-            onClose={() => setSettingsOpen(false)}
-            onSaveSettings={handleSaveSettings}
-            onRescan={handleRescan}
-            onDismissMissing={handleDismissMissing}
-            onResetDefaults={handleResetDefaults}
-          />
-        </div>
+        )}
       </div>
-
-      <div className="relative w-[24px] h-full shrink-0">
-        <div
-          style={{ top: `${Math.max(0, Math.round(layout.handle_offset_y))}px` }}
-          className="absolute left-0"
-        >
-          <EdgeHandle
-            expanded={true}
-            edge={layout.edge}
-            onExpand={() => void handleExpand()}
-            onCollapse={() => void handleRequestCollapse()}
-            onError={handleUnknownError}
-          />
-        </div>
-      </div>
-
-      {contextMenu && (
-        <ContextMenu
-          item={contextMenu.item}
-          x={contextMenu.x}
-          y={contextMenu.y}
-          canMoveUp={contextSubgroup.canMoveUp}
-          canMoveDown={contextSubgroup.canMoveDown}
-          onClose={() => setContextMenu(null)}
-          onLaunch={(item, admin) => void handleLaunch(item, admin)}
-          onTogglePin={(item) => void handleToggleItemPin(item)}
-          onEdit={(item) => {
-            setEditingItem(item);
-            setAddEditOpen(true);
-          }}
-          onOpenLocation={(item) => void handleOpenLocation(item)}
-          onMoveCategory={(item, cat) => void handleMoveCategory(item, cat)}
-          onMoveStep={(item, dir) => void handleMoveStep(item, dir)}
-          onRemove={(item) => void handleRemoveItem(item)}
-        />
-      )}
-    </div>
+    </DockBoundsProvider>
   );
 
   if (inBrowserPreview) {

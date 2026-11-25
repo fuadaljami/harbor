@@ -47,6 +47,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            crate::window_manager::register_main_thread();
             let paths = AppPaths::resolve()?;
             paths.ensure_dirs()?;
 
@@ -99,6 +100,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let coord = app.state::<WindowCoordinator>();
                     let cfg_mgr = app.state::<ConfigManager>();
                     coord.handle_scale_factor_changed(app, &cfg_mgr);
+                }
+                WindowEvent::Resized(_) => {
+                    let coord = app.state::<WindowCoordinator>();
+                    let cfg_mgr = app.state::<ConfigManager>();
+                    coord.handle_window_resized(app, &cfg_mgr);
                 }
                 WindowEvent::DragDrop(dd_event) => match dd_event {
                     DragDropEvent::Enter { paths, .. } => {

@@ -24,6 +24,7 @@ interface SettingsModalProps {
   isPortable: boolean;
   isRescanning: boolean;
   onClose: () => void;
+  onRecordingChange?: (recording: boolean) => void;
   onSaveSettings: (settings: SettingsUpdate) => Promise<void>;
   onRescan: () => Promise<string[]>;
   onDismissMissing: (ids: string[]) => Promise<void>;
@@ -64,6 +65,7 @@ export function SettingsModal({
   isPortable,
   isRescanning,
   onClose,
+  onRecordingChange,
   onSaveSettings,
   onRescan,
   onDismissMissing,
@@ -114,11 +116,20 @@ export function SettingsModal({
   }, [isOpen, config, monitors]);
 
   useEffect(() => {
+    onRecordingChange?.(isOpen && recordingHotkey);
+  }, [isOpen, recordingHotkey, onRecordingChange]);
+
+  useEffect(() => {
     if (!isOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !recordingHotkey) {
+      if (e.key === "Escape") {
+        e.preventDefault();
         e.stopPropagation();
-        onClose();
+        if (recordingHotkey) {
+          setRecordingHotkey(false);
+        } else {
+          onClose();
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown, true);

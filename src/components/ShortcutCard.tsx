@@ -9,6 +9,7 @@ interface ShortcutCardProps {
   iconUrl: string | null;
   sortable: boolean;
   isFocused: boolean;
+  scrollRoot?: HTMLDivElement | null;
   onRequestIcon: (item: DockItem) => void;
   onLaunch: (item: DockItem, runAsAdmin: boolean) => void;
   onOpenContextMenu: (item: DockItem, x: number, y: number) => void;
@@ -68,6 +69,7 @@ export function ShortcutCard({
   iconUrl,
   sortable,
   isFocused,
+  scrollRoot,
   onRequestIcon,
   onLaunch,
   onOpenContextMenu,
@@ -111,11 +113,11 @@ export function ShortcutCard({
           }
         }
       },
-      { rootMargin: "80px" },
+      { root: scrollRoot ?? null, rootMargin: "100px" },
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [item, onRequestIcon]);
+  }, [item, onRequestIcon, scrollRoot]);
 
   const setCombinedRef = (el: HTMLDivElement | null) => {
     localCardRef.current = el;
@@ -149,7 +151,7 @@ export function ShortcutCard({
         isDragging
           ? "opacity-75 bg-harbor-active shadow-xl z-20 relative"
           : isFocused
-            ? "bg-harbor-active ring-1 ring-inset ring-harbor-blurple/60"
+            ? "bg-harbor-active ring-1 ring-inset ring-harbor-blurple/75"
             : "hover:bg-harbor-hover"
       }`}
     >
@@ -170,7 +172,7 @@ export function ShortcutCard({
         )}
       </div>
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 overflow-hidden">
         <div className="flex items-center gap-1.5 min-w-0">
           <span className="text-[13.5px] font-medium text-harbor-textPrimary truncate leading-tight">
             {item.name}

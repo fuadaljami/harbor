@@ -1,4 +1,4 @@
-import { useState, type RefObject } from "react";
+import { useLayoutEffect, useState, type RefObject } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -19,8 +19,12 @@ import {
   SearchX,
   Upload,
 } from "lucide-react";
+import {
+  SECTION_CATEGORIES,
+  getOrderedCategoryItems,
+  type RailCategory,
+} from "../lib/keyboard";
 import type { Category, DockItem } from "../types/dock";
-import type { RailCategory } from "./CategoryRail";
 import { ShortcutCard } from "./ShortcutCard";
 
 interface ShortcutListProps {
@@ -28,6 +32,7 @@ interface ShortcutListProps {
   selectedCategory: RailCategory;
   searchQuery: string;
   focusedItemId: string | null;
+  collapsedSections: Readonly<Record<Category, boolean>>;
   isDropHover: boolean;
   scrollContainerRef: RefObject<HTMLDivElement>;
   getIconUrl: (item: DockItem) => string | null;
@@ -39,12 +44,11 @@ interface ShortcutListProps {
     pinned: boolean,
     orderedIds: string[],
   ) => void;
+  onToggleSection: (category: Category) => void;
   onAddClick: () => void;
   onClearSearch: () => void;
   registerCardRef?: (id: string, el: HTMLDivElement | null) => void;
 }
-
-const SECTION_CATEGORIES: readonly Category[] = ["Games", "Apps", "Tools"];
 
 interface SortableSubgroupProps {
   category: Category;
@@ -52,6 +56,7 @@ interface SortableSubgroupProps {
   items: DockItem[];
   sortable: boolean;
   focusedItemId: string | null;
+  scrollRoot: HTMLDivElement | null;
   getIconUrl: (item: DockItem) => string | null;
   onRequestIcon: (item: DockItem) => void;
   onLaunch: (item: DockItem, runAsAdmin: boolean) => void;
@@ -70,6 +75,7 @@ function SortableSubgroup({
   items,
   sortable,
   focusedItemId,
+  scrollRoot,
   getIconUrl,
   onRequestIcon,
   onLaunch,
@@ -118,6 +124,7 @@ function SortableSubgroup({
               iconUrl={getIconUrl(item)}
               sortable={sortable && items.length > 1}
               isFocused={focusedItemId === item.id}
+              scrollRoot={scrollRoot}
               onRequestIcon={onRequestIcon}
               onLaunch={onLaunch}
               onOpenContextMenu={onOpenContextMenu}
@@ -135,6 +142,7 @@ export function ShortcutList({
   selectedCategory,
   searchQuery,
   focusedItemId,
+  collapsedSections,
   isDropHover,
   scrollContainerRef,
   getIconUrl,
@@ -142,45 +150,38 @@ export function ShortcutList({
   onLaunch,
   onOpenContextMenu,
   onReorderGroup,
+  onToggleSection,
   onAddClick,
   onClearSearch,
   registerCardRef,
 }: ShortcutListProps) {
-  const [collapsedSections, setCollapsedSections] = useState<
-    Record<Category, boolean>
-  >({
-    Games: false,
-    Apps: false,
-    Tools: false,
-  });
+  const [scrollRoot, setScrollRoot] = useState<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    setScrollRoot(scrollContainerRef.current);
+  }, [scrollContainerRef]);
 
   const normalizedQuery = searchQuery.trim().toLowerCase();
   const isSearching = normalizedQuery.length > 0;
   const sortable = !isSearching;
 
-  const matchesQuery = (item: DockItem): boolean => {
-    if (!isSearching) return true;
-    return (
-      item.name.toLowerCase().includes(normalizedQuery) ||
-      item.description.toLowerCase().includes(normalizedQuery) ||
-      item.path.toLowerCase().includes(normalizedQuery)
-    );
-  };
-
-  const filteredByCategory = (cat: Category): DockItem[] =>
-    items.filter((item) => item.category === cat && matchesQuery(item));
-
-  const toggleSection = (cat: Category) => {
-    setCollapsedSections((prev) => ({
-      ...prev,
-      [cat]: !prev[cat],
-    }));
-  };
-
-  const totalVisible =
+  const sections =
     selectedCategory === "All"
-      ? items.filter(matchesQuery).length
-      : filteredByCategory(selectedCategory).length;
+      ? SECTION_CATEGORIES.map((category) => ({
+          category,
+          ...getOrderedCategoryItems(items, category, searchQuery),
+        })).filter((section) => section.combined.length > 0)
+      : [
+          {
+            category: selectedCategory,
+            ...getOrderedCategoryItems(items, selectedCategory, searchQuery),
+          },
+        ].filter((section) => section.combined.length > 0);
+
+  const totalVisible = sections.reduce(
+    (sum, section) => sum + section.combined.length,
+    0,
+  );
 
   const dropTargetCategory =
     selectedCategory === "All" ? "Apps" : selectedCategory;
@@ -235,20 +236,15 @@ export function ShortcutList({
           </div>
         ) : selectedCategory === "All" ? (
           <div className="flex flex-col gap-3 pb-2">
-            {SECTION_CATEGORIES.map((category) => {
-              const sectionItems = filteredByCategory(category);
-              if (sectionItems.length === 0) {
-                return null;
-              }
-              const pinnedItems = sectionItems.filter((i) => i.pinned);
-              const unpinnedItems = sectionItems.filter((i) => !i.pinned);
+            {sections.map(({ category, pinned, unpinned, combined }) => {
               const collapsed = !isSearching && collapsedSections[category];
 
               return (
                 <section key={category} aria-label={category}>
                   <button
                     type="button"
-                    onClick={() => toggleSection(category)}
+                    aria-expanded={!collapsed}
+                    onClick={() => onToggleSection(category)}
                     className="w-full px-1.5 py-1 flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-harbor-textMuted hover:text-harbor-textSecondary transition-colors"
                   >
                     {collapsed ? (
@@ -264,7 +260,7 @@ export function ShortcutList({
                     )}
                     <span>{category}</span>
                     <span className="ml-0.5 text-[10px] font-medium text-harbor-textMuted/80">
-                      — {sectionItems.length}
+                      — {combined.length}
                     </span>
                   </button>
 
@@ -273,9 +269,10 @@ export function ShortcutList({
                       <SortableSubgroup
                         category={category}
                         pinned={true}
-                        items={pinnedItems}
+                        items={pinned}
                         sortable={sortable}
                         focusedItemId={focusedItemId}
+                        scrollRoot={scrollRoot}
                         getIconUrl={getIconUrl}
                         onRequestIcon={onRequestIcon}
                         onLaunch={onLaunch}
@@ -286,9 +283,10 @@ export function ShortcutList({
                       <SortableSubgroup
                         category={category}
                         pinned={false}
-                        items={unpinnedItems}
+                        items={unpinned}
                         sortable={sortable}
                         focusedItemId={focusedItemId}
+                        scrollRoot={scrollRoot}
                         getIconUrl={getIconUrl}
                         onRequestIcon={onRequestIcon}
                         onLaunch={onLaunch}
@@ -304,36 +302,38 @@ export function ShortcutList({
           </div>
         ) : (
           <div className="flex flex-col gap-0.5 pb-2">
-            <SortableSubgroup
-              category={selectedCategory}
-              pinned={true}
-              items={filteredByCategory(selectedCategory).filter(
-                (i) => i.pinned,
-              )}
-              sortable={sortable}
-              focusedItemId={focusedItemId}
-              getIconUrl={getIconUrl}
-              onRequestIcon={onRequestIcon}
-              onLaunch={onLaunch}
-              onOpenContextMenu={onOpenContextMenu}
-              onReorderGroup={onReorderGroup}
-              registerCardRef={registerCardRef}
-            />
-            <SortableSubgroup
-              category={selectedCategory}
-              pinned={false}
-              items={filteredByCategory(selectedCategory).filter(
-                (i) => !i.pinned,
-              )}
-              sortable={sortable}
-              focusedItemId={focusedItemId}
-              getIconUrl={getIconUrl}
-              onRequestIcon={onRequestIcon}
-              onLaunch={onLaunch}
-              onOpenContextMenu={onOpenContextMenu}
-              onReorderGroup={onReorderGroup}
-              registerCardRef={registerCardRef}
-            />
+            {sections.map(({ category, pinned, unpinned }) => (
+              <div key={category} className="flex flex-col gap-0.5">
+                <SortableSubgroup
+                  category={category}
+                  pinned={true}
+                  items={pinned}
+                  sortable={sortable}
+                  focusedItemId={focusedItemId}
+                  scrollRoot={scrollRoot}
+                  getIconUrl={getIconUrl}
+                  onRequestIcon={onRequestIcon}
+                  onLaunch={onLaunch}
+                  onOpenContextMenu={onOpenContextMenu}
+                  onReorderGroup={onReorderGroup}
+                  registerCardRef={registerCardRef}
+                />
+                <SortableSubgroup
+                  category={category}
+                  pinned={false}
+                  items={unpinned}
+                  sortable={sortable}
+                  focusedItemId={focusedItemId}
+                  scrollRoot={scrollRoot}
+                  getIconUrl={getIconUrl}
+                  onRequestIcon={onRequestIcon}
+                  onLaunch={onLaunch}
+                  onOpenContextMenu={onOpenContextMenu}
+                  onReorderGroup={onReorderGroup}
+                  registerCardRef={registerCardRef}
+                />
+              </div>
+            ))}
           </div>
         )}
       </div>

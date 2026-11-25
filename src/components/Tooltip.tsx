@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { useDockHorizontalBounds } from "../lib/dockBounds";
 
 export type TooltipSide = "left" | "right" | "top" | "bottom";
 
@@ -40,6 +41,7 @@ export function Tooltip({
   const tipRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [coords, setCoords] = useState<TooltipCoords | null>(null);
+  const getDockBounds = useDockHorizontalBounds();
 
   const updatePosition = useCallback(() => {
     const triggerEl = triggerRef.current;
@@ -50,15 +52,30 @@ export function Tooltip({
     const tp = tipEl.getBoundingClientRect();
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+    const dockBounds = getDockBounds();
+    const minX = Math.max(0, dockBounds.minX);
+    const maxX = Math.min(vw, dockBounds.maxX);
 
     let resolvedSide = side;
-    if (side === "right" && tr.right + TRIGGER_GAP + tp.width > vw - VIEWPORT_PADDING) {
+    if (
+      side === "right" &&
+      tr.right + TRIGGER_GAP + tp.width > maxX - VIEWPORT_PADDING
+    ) {
       resolvedSide = "left";
-    } else if (side === "left" && tr.left - TRIGGER_GAP - tp.width < VIEWPORT_PADDING) {
+    } else if (
+      side === "left" &&
+      tr.left - TRIGGER_GAP - tp.width < minX + VIEWPORT_PADDING
+    ) {
       resolvedSide = "right";
-    } else if (side === "top" && tr.top - TRIGGER_GAP - tp.height < VIEWPORT_PADDING) {
+    } else if (
+      side === "top" &&
+      tr.top - TRIGGER_GAP - tp.height < VIEWPORT_PADDING
+    ) {
       resolvedSide = "bottom";
-    } else if (side === "bottom" && tr.bottom + TRIGGER_GAP + tp.height > vh - VIEWPORT_PADDING) {
+    } else if (
+      side === "bottom" &&
+      tr.bottom + TRIGGER_GAP + tp.height > vh - VIEWPORT_PADDING
+    ) {
       resolvedSide = "top";
     }
 
@@ -78,10 +95,9 @@ export function Tooltip({
       top = tr.top - TRIGGER_GAP - tp.height;
     }
 
-    const clampedLeft = Math.min(
-      Math.max(left, VIEWPORT_PADDING),
-      Math.max(VIEWPORT_PADDING, vw - tp.width - VIEWPORT_PADDING),
-    );
+    const minLeft = minX + VIEWPORT_PADDING;
+    const maxLeft = Math.max(minLeft, maxX - tp.width - VIEWPORT_PADDING);
+    const clampedLeft = Math.min(Math.max(left, minLeft), maxLeft);
     const clampedTop = Math.min(
       Math.max(top, VIEWPORT_PADDING),
       Math.max(VIEWPORT_PADDING, vh - tp.height - VIEWPORT_PADDING),
@@ -103,7 +119,7 @@ export function Tooltip({
       arrowTop,
       resolvedSide,
     });
-  }, [side]);
+  }, [side, getDockBounds]);
 
   useLayoutEffect(() => {
     if (!open || disabled) return;

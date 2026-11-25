@@ -716,9 +716,10 @@ fn discover_steam_games(
                 continue;
             }
 
+            let clean_name = clean_steam_game_name(&manifest.name);
             let game_dir = steamapps.join("common").join(&manifest.installdir);
             let icon_source_path = if game_dir.is_dir() {
-                find_steam_game_exe(&game_dir, &manifest.name)
+                find_steam_game_exe(&game_dir, &clean_name)
                     .map(|p| p.to_string_lossy().into_owned())
             } else {
                 None
@@ -727,7 +728,7 @@ fn discover_steam_games(
             let dismissal_key = format!("steam:{}", manifest.appid.to_ascii_lowercase());
             games.push(DockItem {
                 id: derive_scanned_id(&dismissal_key),
-                name: manifest.name,
+                name: clean_name,
                 path: format!("steam://rungameid/{}", manifest.appid),
                 arguments: String::new(),
                 description: "Steam Game".to_owned(),
@@ -1000,10 +1001,21 @@ pub fn parse_app_manifest(acf_text: &str) -> Option<SteamAppManifest> {
     })
 }
 
+/// Strips trademark/copyright symbols (`®`, `™`, `©`) and collapses extra spaces from Steam names.
+#[must_use]
+pub fn clean_steam_game_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| c != '\u{00AE}' && c != '\u{2122}' && c != '\u{00A9}')
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn is_steam_redistributable(appid: &str, name: &str) -> bool {
     if matches!(
         appid.trim(),
-        "228980"
+        "480" // Spacewar SDK test app
+            | "228980"
             | "1070560"
             | "1391110"
             | "1628350"
@@ -1023,6 +1035,7 @@ fn is_steam_redistributable(appid: &str, name: &str) -> bool {
 
     let tokens = tokenize_words(name);
     const REDIST_PHRASES: &[&[&str]] = &[
+        &["spacewar"],
         &["steamworks", "common", "redistributables"],
         &["steam", "linux", "runtime"],
         &["redistributable"],
@@ -1263,7 +1276,7 @@ mod tests {
             ),
         )?;
 
-        // Installed Hades + Steamworks Redist (must be skipped) + new Celeste.
+        // Installed Hades + Steamworks Redist (228980) + Spacewar (480) + Call of Duty with ®/™ + Celeste.
         std::fs::write(
             steamapps.join("appmanifest_1145360.acf"),
             "\"AppState\" { \"appid\" \"1145360\" \"name\" \"Hades\" \"installdir\" \"Hades\" }",
@@ -1273,8 +1286,12 @@ mod tests {
             "\"AppState\" { \"appid\" \"228980\" \"name\" \"Steamworks Common Redistributables\" \"installdir\" \"Steamworks Shared\" }",
         )?;
         std::fs::write(
+            steamapps.join("appmanifest_480.acf"),
+            "\"AppState\" { \"appid\" \"480\" \"name\" \"Spacewar\" \"installdir\" \"Spacewar\" }",
+        )?;
+        std::fs::write(
             steamapps.join("appmanifest_504230.acf"),
-            "\"AppState\" { \"appid\" \"504230\" \"name\" \"Celeste\" \"installdir\" \"Celeste\" }",
+            "\"AppState\" { \"appid\" \"504230\" \"name\" \"Celeste™\" \"installdir\" \"Celeste\" }",
         )?;
 
         // Dismissed game should NOT be re-added even if present.
@@ -1368,7 +1385,7 @@ mod tests {
         let scan = discover_items(&env, &resolver, &host);
         let rescan = merge_discovered_items(&mut config, &scan, &host);
 
-        // Only Celeste should be added (Hades existed, Portal 2 dismissed, 228980 redist skipped).
+        // Only Celeste should be added (Hades existed, Portal 2 dismissed, 228980 & 480 skipped).
         assert_eq!(rescan.added, 1);
         assert!(config.items.iter().any(|i| i.name == "Celeste"));
         assert!(!config.items.iter().any(|i| i.name == "Portal 2"));
@@ -1376,6 +1393,14 @@ mod tests {
             .items
             .iter()
             .any(|i| i.steam_app_id.as_deref() == Some("228980")));
+        assert!(!config
+            .items
+            .iter()
+            .any(|i| i.steam_app_id.as_deref() == Some("480")));
+        assert_eq!(
+            clean_steam_game_name("Call of Duty®: Modern Warfare® ©"),
+            "Call of Duty: Modern Warfare"
+        );
 
         // User-edited fields on Hades must stay completely untouched, while missing icon_source_path backfills.
         let Some(hades) = config.items.iter().find(|i| i.id == "user-hades") else {

@@ -11,6 +11,7 @@ import {
   Shield,
   Trash2,
 } from "lucide-react";
+import { useDockHorizontalBounds } from "../lib/dockBounds";
 import type { Category, DockItem } from "../types/dock";
 
 interface ContextMenuProps {
@@ -60,6 +61,7 @@ export function ContextMenu({
   onRemove,
 }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const getDockBounds = useDockHorizontalBounds();
   const [pos, setPos] = useState<{ left: number; top: number }>({
     left: x,
     top: y,
@@ -69,19 +71,20 @@ export function ContextMenu({
     const el = menuRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const maxLeft = Math.max(
-      VIEWPORT_PADDING,
-      window.innerWidth - rect.width - VIEWPORT_PADDING,
-    );
+    const dockBounds = getDockBounds();
+    const minX = Math.max(0, dockBounds.minX);
+    const maxX = Math.min(window.innerWidth, dockBounds.maxX);
+    const minLeft = minX + VIEWPORT_PADDING;
+    const maxLeft = Math.max(minLeft, maxX - rect.width - VIEWPORT_PADDING);
     const maxTop = Math.max(
       VIEWPORT_PADDING,
       window.innerHeight - rect.height - VIEWPORT_PADDING,
     );
     setPos({
-      left: Math.min(Math.max(x, VIEWPORT_PADDING), maxLeft),
+      left: Math.min(Math.max(x, minLeft), maxLeft),
       top: Math.min(Math.max(y, VIEWPORT_PADDING), maxTop),
     });
-  }, [x, y, item.id]);
+  }, [x, y, item.id, getDockBounds]);
 
   useEffect(() => {
     const handlePointerDown = (e: PointerEvent) => {

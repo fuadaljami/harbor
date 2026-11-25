@@ -17,9 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HINSTANCE, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, MonitorFromPoint, ReleaseDC,
-    BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    CombineRgn, CreateRectRgn, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW,
+    MonitorFromPoint, ReleaseDC, SetWindowRgn, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_ERROR,
+    RGN_OR,
 };
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{
@@ -43,8 +44,9 @@ use windows::Win32::UI::Shell::{
     SHGFI_LARGEICON, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, GetCursorPos, GetIconInfo, GetSystemMetrics, SetWindowPos, HICON, ICONINFO,
-    SM_SWAPBUTTON, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL,
+    DestroyIcon, GetCursorPos, GetForegroundWindow, GetIconInfo, GetSystemMetrics, SetWindowPos,
+    HICON, ICONINFO, SM_SWAPBUTTON, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOWNORMAL,
 };
 
 use crate::error::{AppError, AppResult};
@@ -149,6 +151,38 @@ impl OwnedHbitmap {
 }
 
 impl Drop for OwnedHbitmap {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.0 .0));
+            }
+        }
+    }
+}
+
+/// RAII wrapper for Win32 `HRGN` calling `DeleteObject` on drop unless disarmed after
+/// handing ownership to `SetWindowRgn`.
+struct OwnedHrgn(HRGN);
+
+impl OwnedHrgn {
+    fn new(handle: HRGN) -> Self {
+        Self(handle)
+    }
+
+    fn as_raw(&self) -> HRGN {
+        self.0
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.0.is_invalid()
+    }
+
+    fn disarm(&mut self) {
+        self.0 = HRGN::default();
+    }
+}
+
+impl Drop for OwnedHrgn {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
@@ -401,10 +435,10 @@ impl WinShell {
         match tokio::time::timeout(Duration::from_secs(ICON_TIMEOUT_SECS), fut).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(err)) => {
-                tracing::debug!(
+                tracing::warn!(
                     path = %trimmed,
                     error = %err,
-                    "Icon extraction unavailable; falling back to monogram"
+                    "Icon extraction failed; falling back to monogram"
                 );
                 Ok(None)
             }
@@ -568,14 +602,28 @@ pub fn is_drive_mounted(path: &Path) -> bool {
     }
 }
 
-fn extract_drive_root(path: &Path) -> Option<String> {
+/// Strips Windows `\\?\` verbatim prefixes so Win32 Shell APIs (`SHCreateItemFromParsingName`,
+/// `SHGetFileInfoW`, `ShellExecuteExW`, `GetDriveTypeW`) accept the path cleanly.
+#[must_use]
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix("\\\\?\\UNC\\") {
+        return PathBuf::from(format!("\\\\{unc}"));
+    }
+    if let Some(local) = raw.strip_prefix("\\\\?\\") {
+        return PathBuf::from(local);
+    }
+    path.to_path_buf()
+}
+
+fn extract_drive_root(path: &Path) -> Option<String> {
+    let clean = strip_verbatim_prefix(path);
+    let raw = clean.to_string_lossy();
     let trimmed = raw.trim().trim_matches('"');
-    let stripped = trimmed.strip_prefix("\\\\?\\").unwrap_or(trimmed);
-    if stripped.starts_with("\\\\") {
+    if trimmed.starts_with("\\\\") {
         return None;
     }
-    let bytes = stripped.as_bytes();
+    let bytes = trimmed.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         let drive = (bytes[0] as char).to_ascii_uppercase();
         return Some(format!("{drive}:\\"));
@@ -638,20 +686,25 @@ fn extract_and_cache_icon_sync(
     source_path: &str,
     icon_cache_dir: &Path,
 ) -> AppResult<Option<String>> {
-    let path = Path::new(source_path);
-    if !is_drive_local_and_available(path) {
+    let input_path = strip_verbatim_prefix(Path::new(source_path));
+    if !is_drive_local_and_available(&input_path) {
         return Ok(None);
     }
 
-    let meta = match std::fs::metadata(path) {
+    let meta = match std::fs::metadata(&input_path) {
         Ok(m) => m,
-        Err(_) => return Ok(None),
+        Err(err) => {
+            tracing::warn!(path = %input_path.display(), error = %err, "Icon target metadata unavailable");
+            return Ok(None);
+        }
     };
     if !meta.is_file() {
         return Ok(None);
     }
 
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = strip_verbatim_prefix(
+        &std::fs::canonicalize(&input_path).unwrap_or_else(|_| input_path.clone()),
+    );
     let canonical_key = normalize_path_key(&canonical.to_string_lossy());
     let file_size = meta.len();
     let mtime_secs = meta
@@ -661,22 +714,23 @@ fn extract_and_cache_icon_sync(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let clean_cache_dir = strip_verbatim_prefix(icon_cache_dir);
     let cache_hash = compute_icon_cache_key(&canonical_key, file_size, mtime_secs);
-    let cache_file = icon_cache_dir.join(format!("{cache_hash}.png"));
+    let cache_file = clean_cache_dir.join(format!("{cache_hash}.png"));
     if cache_file.is_file() {
         return Ok(Some(cache_file.to_string_lossy().into_owned()));
     }
 
-    std::fs::create_dir_all(icon_cache_dir)?;
+    std::fs::create_dir_all(&clean_cache_dir)?;
 
     // Support direct custom PNG icon files cleanly without going through thumbnail providers.
-    let is_png = path
+    let is_png = canonical
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("png"));
 
     if is_png {
-        let bytes = std::fs::read(path)?;
+        let bytes = std::fs::read(&canonical)?;
         let decoded = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
             .map_err(|err| AppError::Shell(format!("Invalid custom PNG icon: {err}")))?;
         let rgba_img = if decoded.width() > 128 || decoded.height() > 128 {
@@ -691,8 +745,30 @@ fn extract_and_cache_icon_sync(
     }
 
     let wide_path = to_wide_null(&canonical.to_string_lossy());
-    let extracted = extract_via_image_factory(&wide_path)
-        .or_else(|_| extract_via_shgetfileinfo(&wide_path))?;
+    let extracted = match extract_via_image_factory(&wide_path) {
+        Ok(Some(pixels)) => Some(pixels),
+        Ok(None) => extract_via_shgetfileinfo(&wide_path)?,
+        Err(primary_err) => match extract_via_shgetfileinfo(&wide_path) {
+            Ok(Some(pixels)) => Some(pixels),
+            Ok(None) => {
+                tracing::warn!(
+                    path = %canonical.display(),
+                    primary_error = %primary_err,
+                    "Icon extraction returned empty handle from both IShellItemImageFactory and SHGetFileInfoW"
+                );
+                None
+            }
+            Err(fallback_err) => {
+                tracing::warn!(
+                    path = %canonical.display(),
+                    primary_error = %primary_err,
+                    fallback_error = %fallback_err,
+                    "Icon extraction failed on both IShellItemImageFactory and SHGetFileInfoW"
+                );
+                return Err(fallback_err);
+            }
+        },
+    };
 
     let Some((width, height, rgba)) = extracted else {
         return Ok(None);
@@ -966,9 +1042,11 @@ fn launch_target_sync(target: &str, arguments: &str, run_as_admin: bool) -> AppR
 }
 
 fn open_file_location_sync(target: &str) -> AppResult<()> {
-    let path = Path::new(target);
+    let path = strip_verbatim_prefix(Path::new(target));
     if path.is_file() {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical = strip_verbatim_prefix(
+            &std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+        );
         let select_arg = format!("/select,\"{}\"", canonical.to_string_lossy());
         return launch_target_sync("explorer.exe", &select_arg, false);
     }
@@ -1046,6 +1124,74 @@ pub fn move_window_no_resize_async(hwnd_raw: isize, x: i32, y: i32) -> AppResult
         )
     }
     .map_err(|err| AppError::Window(format!("SetWindowPos failed: {err}")))
+}
+
+/// Checks whether `hwnd_raw` is currently the active Win32 foreground window.
+#[must_use]
+pub fn is_window_foreground(hwnd_raw: isize) -> bool {
+    unsafe { GetForegroundWindow() }.0 as isize == hwnd_raw
+}
+
+/// Applies a combined two-rect window clipping region (`dock_rect` | `handle_rect`) to `hwnd_raw`.
+/// Must be called on the UI/main thread.
+pub fn set_window_region_union(
+    hwnd_raw: isize,
+    dock_rect: (i32, i32, i32, i32),
+    handle_rect: (i32, i32, i32, i32),
+) -> AppResult<()> {
+    let dock_rgn = OwnedHrgn::new(unsafe {
+        CreateRectRgn(dock_rect.0, dock_rect.1, dock_rect.2, dock_rect.3)
+    });
+    if !dock_rgn.is_valid() {
+        return Err(AppError::Window("CreateRectRgn(dock) returned null".to_owned()));
+    }
+
+    let handle_rgn = OwnedHrgn::new(unsafe {
+        CreateRectRgn(handle_rect.0, handle_rect.1, handle_rect.2, handle_rect.3)
+    });
+    if !handle_rgn.is_valid() {
+        return Err(AppError::Window("CreateRectRgn(handle) returned null".to_owned()));
+    }
+
+    let mut combined_rgn = OwnedHrgn::new(unsafe { CreateRectRgn(0, 0, 0, 0) });
+    if !combined_rgn.is_valid() {
+        return Err(AppError::Window(
+            "CreateRectRgn(combined) returned null".to_owned(),
+        ));
+    }
+
+    let combine_res = unsafe {
+        CombineRgn(
+            Some(combined_rgn.as_raw()),
+            Some(dock_rgn.as_raw()),
+            Some(handle_rgn.as_raw()),
+            RGN_OR,
+        )
+    };
+    if combine_res == RGN_ERROR {
+        return Err(AppError::Window("CombineRgn(RGN_OR) failed".to_owned()));
+    }
+
+    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    let set_res = unsafe { SetWindowRgn(hwnd, Some(combined_rgn.as_raw()), true) };
+    if set_res == 0 {
+        return Err(AppError::Window("SetWindowRgn(combined) failed".to_owned()));
+    }
+
+    // Windows owns the HRGN once SetWindowRgn succeeds; disarm RAII deletion.
+    combined_rgn.disarm();
+    Ok(())
+}
+
+/// Clears any active window clipping region so the collapsed `24x84` handle is unclipped.
+/// Must be called on the UI/main thread.
+pub fn clear_window_region(hwnd_raw: isize) -> AppResult<()> {
+    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    let set_res = unsafe { SetWindowRgn(hwnd, None, true) };
+    if set_res == 0 {
+        tracing::debug!("SetWindowRgn(None) returned 0 (no active region or window closing)");
+    }
+    Ok(())
 }
 
 /// Enables or disables starting Harbor with Windows via `HKCU\...\Run`.
@@ -1325,6 +1471,54 @@ mod tests {
         let empty = vec![0, 0, 0, 0, 0, 0, 0, 0];
         let empty_rgba = bgra_premultiplied_to_straight_rgba(&empty)?;
         assert_eq!(empty_rgba, empty);
+        Ok(())
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefixes() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Windows\System32\notepad.exe")),
+            PathBuf::from(r"C:\Windows\System32\notepad.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\app.exe")),
+            PathBuf::from(r"\\server\share\app.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"E:\Games\Hades\Hades.exe")),
+            PathBuf::from(r"E:\Games\Hades\Hades.exe")
+        );
+    }
+
+    #[tokio::test]
+    async fn extracts_real_windows_icon_to_png_cache() -> AppResult<()> {
+        let notepad = Path::new(r"C:\Windows\System32\notepad.exe");
+        if !notepad.is_file() {
+            return Ok(());
+        }
+        let seq = CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_cache = std::env::temp_dir().join(format!(
+            "harbor_icon_test_{}_{}",
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_dir_all(&temp_cache);
+
+        let shell = WinShell::new()?;
+        let extracted = shell
+            .extract_icon_cached(r"C:\Windows\System32\notepad.exe", &temp_cache)
+            .await?;
+
+        let Some(png_path) = extracted else {
+            panic!("Expected extracted PNG icon for notepad.exe");
+        };
+        assert!(!png_path.starts_with(r"\\?\"));
+        let png_file = Path::new(&png_path);
+        assert!(png_file.is_file());
+        let bytes = std::fs::read(png_file)?;
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
         Ok(())
     }
 }
