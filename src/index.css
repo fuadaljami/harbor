@@ -1,0 +1,48 @@
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: "Inter", "Segoe UI Variable", "Segoe UI", sans-serif;
+    color: #f2f3f5;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  input,
+  textarea {
+    user-select: text;
+  }
+}
+
+/* Custom slim dark scrollbars (6px thumb, transparent track) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 155, 164, 0.25);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 155, 164, 0.45);
+}
