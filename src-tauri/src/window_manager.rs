@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread::ThreadId;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -12,33 +11,10 @@ use crate::error::{AppError, AppResult};
 use crate::models::DockEdge;
 use crate::win_shell;
 
-static MAIN_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
-
-/// Records the main UI thread ID during `setup()` so `SetWindowRgn` can execute on the main
-/// thread synchronously when already on it or synchronously wait via `run_on_main_thread` otherwise.
-pub fn register_main_thread() {
-    let _ = MAIN_THREAD_ID.set(std::thread::current().id());
-}
-
-fn run_sync_on_main_thread<F>(app: &AppHandle, task: F) -> AppResult<()>
-where
-    F: FnOnce() -> AppResult<()> + Send + 'static,
-{
-    if MAIN_THREAD_ID.get().copied() == Some(std::thread::current().id()) {
-        return task();
-    }
-    let (tx, rx) = std::sync::mpsc::sync_channel::<AppResult<()>>(1);
-    app.run_on_main_thread(move || {
-        let _ = tx.send(task());
-    })?;
-    rx.recv()
-        .map_err(|_| AppError::Window("Main thread task channel closed".to_owned()))?
-}
-
 pub const DOCK_PANEL_WIDTH_LOGICAL: f64 = 380.0;
 pub const HANDLE_WIDTH_LOGICAL: f64 = 24.0;
 pub const HANDLE_HEIGHT_LOGICAL: f64 = 84.0;
-pub const EXPANDED_WIDTH_LOGICAL: f64 = DOCK_PANEL_WIDTH_LOGICAL + HANDLE_WIDTH_LOGICAL;
+pub const EXPANDED_WIDTH_LOGICAL: f64 = DOCK_PANEL_WIDTH_LOGICAL;
 pub const MAX_DOCK_HEIGHT_LOGICAL: f64 = 640.0;
 pub const EDGE_MARGIN_LOGICAL: f64 = 8.0;
 pub const WORK_AREA_VERTICAL_PADDING_LOGICAL: f64 = 24.0;
@@ -82,29 +58,6 @@ pub struct ComputedDockLayout {
     pub expanded_top_logical: f64,
     pub dock_height_logical: f64,
     pub handle_offset_y_logical: f64,
-}
-
-/// Window-relative physical clipping rectangle `(left, top, right, bottom)` for `CreateRectRgn`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RegionRect {
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-}
-
-impl RegionRect {
-    #[must_use]
-    pub fn as_tuple(self) -> (i32, i32, i32, i32) {
-        (self.left, self.top, self.right, self.bottom)
-    }
-}
-
-/// Union region rects for the expanded dock window (`dock_rect` | `handle_rect`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpandedWindowRegionRects {
-    pub dock_rect: RegionRect,
-    pub handle_rect: RegionRect,
 }
 
 /// Layout state synchronized to the frontend.
@@ -322,11 +275,13 @@ impl WindowCoordinator {
         let computed = compute_dock_layout(work_area, scale, cfg.edge, cfg.top_position);
 
         window.set_always_on_top(cfg.always_on_top)?;
-        self.clear_region_for(app, &window)?;
         self.apply_physical_bounds(&window, computed.collapsed_rect_phys)?;
 
         let outer = window.outer_size()?;
+        let pos = window.outer_position()?;
         tracing::info!(
+            x = pos.x,
+            y = pos.y,
             width = outer.width,
             height = outer.height,
             scale_factor = scale,
@@ -338,9 +293,9 @@ impl WindowCoordinator {
         Ok(())
     }
 
-    /// Expands the dock immediately: bumps epoch, resizes & positions native window FIRST,
-    /// applies the expanded HWND region, activates/focuses with 50ms foreground check,
-    /// and emits `harbor://layout-changed`.
+    /// Expands the dock immediately: bumps epoch, resizes & positions native window to
+    /// `380 x dock_h` FIRST, activates/focuses with 50ms foreground check, and emits
+    /// `harbor://layout-changed`.
     pub fn expand_dock(
         &self,
         app: &AppHandle,
@@ -362,7 +317,8 @@ impl WindowCoordinator {
             next_epoch
         };
 
-        self.apply_expanded_bounds_and_region(app, &window, &cfg, &computed, scale)?;
+        window.set_always_on_top(cfg.always_on_top)?;
+        self.apply_physical_bounds(&window, computed.expanded_rect_phys)?;
         let _ = window.show();
         let _ = window.set_focus();
         self.verify_foreground_focus(app, &window, expand_epoch);
@@ -379,8 +335,8 @@ impl WindowCoordinator {
         Ok(layout)
     }
 
-    /// Initiates an epoch-guarded collapse sequence: sets `Collapsing`, emits `harbor://request-collapse`,
-    /// and schedules a `300ms` fallback commit timer.
+    /// Initiates an idempotent, epoch-guarded collapse sequence when currently `Expanded`:
+    /// sets `Collapsing`, emits `harbor://request-collapse`, and schedules a `300ms` fallback timer.
     pub fn request_collapse_dock(
         &self,
         app: &AppHandle,
@@ -388,15 +344,16 @@ impl WindowCoordinator {
     ) -> AppResult<WindowLayoutState> {
         let maybe_epoch = {
             let mut state = self.inner.lock();
-            if state.phase == WindowPhase::Collapsed {
-                None
-            } else {
-                if let Some(drag) = state.drag_session.take() {
-                    drag.active.store(false, Ordering::Release);
+            match state.phase {
+                WindowPhase::Collapsed | WindowPhase::Collapsing => None,
+                WindowPhase::Expanded => {
+                    if let Some(drag) = state.drag_session.take() {
+                        drag.active.store(false, Ordering::Release);
+                    }
+                    let next_epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    state.phase = WindowPhase::Collapsing;
+                    Some(next_epoch)
                 }
-                let next_epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                state.phase = WindowPhase::Collapsing;
-                Some(next_epoch)
             }
         };
 
@@ -423,8 +380,8 @@ impl WindowCoordinator {
         self.current_layout_state(app, config_mgr)
     }
 
-    /// Idempotent collapse commit: clears `SetWindowRgn` FIRST, then shrinks the window to `24x84`
-    /// ONLY if `expected_epoch` still matches and phase is still `Collapsing`.
+    /// Idempotent collapse commit: shrinks & repositions the window to `24x84` flush against
+    /// the active edge ONLY if `expected_epoch` still matches and phase is still `Collapsing`.
     pub fn commit_collapse_window(
         &self,
         app: &AppHandle,
@@ -446,15 +403,16 @@ impl WindowCoordinator {
         let (work_area, scale) = resolve_active_work_area(&window, cfg.monitor_name.as_deref())?;
         let computed = compute_dock_layout(work_area, scale, cfg.edge, cfg.top_position);
 
-        // Strict lifecycle order: clear region BEFORE shrinking to 24x84 so collapsed handle
-        // on the Right edge is never clipped by a stale expanded region.
-        self.clear_region_for(app, &window)?;
         self.apply_physical_bounds(&window, computed.collapsed_rect_phys)?;
 
         let outer = window.outer_size()?;
+        let pos = window.outer_position()?;
         tracing::info!(
+            x = pos.x,
+            y = pos.y,
             width = outer.width,
             height = outer.height,
+            edge = ?cfg.edge,
             epoch = expected_epoch,
             "Committed collapsed window outer_size"
         );
@@ -498,8 +456,7 @@ impl WindowCoordinator {
         Ok(layout)
     }
 
-    /// Re-applies current phase geometry and HWND clipping region
-    /// (after edge switch, monitor switch, or DPI change).
+    /// Re-applies current phase geometry (after edge switch, monitor switch, or DPI change).
     pub fn reapply_current_layout(
         &self,
         app: &AppHandle,
@@ -509,16 +466,34 @@ impl WindowCoordinator {
         let window = main_window(app)?;
         let (work_area, scale) = resolve_active_work_area(&window, cfg.monitor_name.as_deref())?;
         let computed = compute_dock_layout(work_area, scale, cfg.edge, cfg.top_position);
-        let phase = self.inner.lock().phase;
+        let phase = {
+            let mut state = self.inner.lock();
+            if state.phase == WindowPhase::Expanded {
+                // Refresh blur grace window before moving across edges or monitors so
+                // transient focus churn during SetWindowPos cannot auto-collapse the dock.
+                state.last_expand_instant = Some(Instant::now());
+            }
+            state.phase
+        };
 
+        window.set_always_on_top(cfg.always_on_top)?;
         match phase {
             WindowPhase::Collapsed | WindowPhase::Collapsing => {
-                window.set_always_on_top(cfg.always_on_top)?;
-                self.clear_region_for(app, &window)?;
                 self.apply_physical_bounds(&window, computed.collapsed_rect_phys)?;
             }
             WindowPhase::Expanded => {
-                self.apply_expanded_bounds_and_region(app, &window, &cfg, &computed, scale)?;
+                self.apply_physical_bounds(&window, computed.expanded_rect_phys)?;
+                let _ = window.set_focus();
+                let pos = window.outer_position()?;
+                let outer = window.outer_size()?;
+                tracing::info!(
+                    x = pos.x,
+                    y = pos.y,
+                    width = outer.width,
+                    height = outer.height,
+                    edge = ?cfg.edge,
+                    "Reapplied expanded window bounds"
+                );
             }
         }
 
@@ -532,97 +507,6 @@ impl WindowCoordinator {
         };
         let _ = app.emit(EVENT_LAYOUT_CHANGED, &layout);
         Ok(layout)
-    }
-
-    /// Recomputes and reapplies the expanded HWND region if an external resize occurs while expanded.
-    pub fn handle_window_resized(&self, app: &AppHandle, config_mgr: &ConfigManager) {
-        if self.is_applying_layout.load(Ordering::Acquire) {
-            return;
-        }
-        let phase = self.inner.lock().phase;
-        if phase != WindowPhase::Expanded {
-            return;
-        }
-        let cfg = config_mgr.snapshot();
-        let Ok(window) = main_window(app) else {
-            return;
-        };
-        let Ok((work_area, scale)) = resolve_active_work_area(&window, cfg.monitor_name.as_deref())
-        else {
-            return;
-        };
-        let computed = compute_dock_layout(work_area, scale, cfg.edge, cfg.top_position);
-        if let Err(err) = self.apply_region_from_outer_size(
-            app,
-            &window,
-            cfg.edge,
-            scale,
-            computed.handle_offset_y_logical,
-        ) {
-            tracing::warn!(error = %err, "Failed to update region on WindowEvent::Resized");
-        }
-    }
-
-    fn apply_expanded_bounds_and_region(
-        &self,
-        app: &AppHandle,
-        window: &WebviewWindow,
-        cfg: &crate::models::DockConfig,
-        computed: &ComputedDockLayout,
-        scale: f64,
-    ) -> AppResult<()> {
-        window.set_always_on_top(cfg.always_on_top)?;
-        self.apply_physical_bounds(window, computed.expanded_rect_phys)?;
-        self.apply_region_from_outer_size(
-            app,
-            window,
-            cfg.edge,
-            scale,
-            computed.handle_offset_y_logical,
-        )
-    }
-
-    fn apply_region_from_outer_size(
-        &self,
-        app: &AppHandle,
-        window: &WebviewWindow,
-        edge: DockEdge,
-        scale: f64,
-        handle_offset_y_logical: f64,
-    ) -> AppResult<()> {
-        let outer = window.outer_size()?;
-        if outer.width < 2 || outer.height < 2 {
-            return Ok(());
-        }
-        let region = compute_expanded_window_region(
-            outer.width,
-            outer.height,
-            scale,
-            edge,
-            handle_offset_y_logical,
-        );
-        let hwnd_raw = window.hwnd()?.0 as isize;
-        let dock_tuple = region.dock_rect.as_tuple();
-        let handle_tuple = region.handle_rect.as_tuple();
-
-        tracing::debug!(
-            outer_width = outer.width,
-            outer_height = outer.height,
-            edge = ?edge,
-            scale_factor = scale,
-            dock_rect = ?dock_tuple,
-            handle_rect = ?handle_tuple,
-            "Applying SetWindowRgn for expanded dock"
-        );
-
-        run_sync_on_main_thread(app, move || {
-            win_shell::set_window_region_union(hwnd_raw, dock_tuple, handle_tuple)
-        })
-    }
-
-    fn clear_region_for(&self, app: &AppHandle, window: &WebviewWindow) -> AppResult<()> {
-        let hwnd_raw = window.hwnd()?.0 as isize;
-        run_sync_on_main_thread(app, move || win_shell::clear_window_region(hwnd_raw))
     }
 
     fn verify_foreground_focus(&self, app: &AppHandle, window: &WebviewWindow, expand_epoch: u64) {
@@ -672,6 +556,9 @@ impl WindowCoordinator {
 
     /// Evaluates blur auto-collapse guardrails before requesting collapse.
     pub fn handle_window_blur(&self, app: &AppHandle, config_mgr: &ConfigManager) {
+        if self.is_applying_layout.load(Ordering::Acquire) {
+            return;
+        }
         let cfg = config_mgr.snapshot();
         if !cfg.auto_collapse_on_blur || self.is_pinned() {
             return;
@@ -827,17 +714,22 @@ impl WindowCoordinator {
     fn apply_physical_bounds(&self, window: &WebviewWindow, rect: PhysRect) -> AppResult<()> {
         self.is_applying_layout.store(true, Ordering::Release);
         let res: AppResult<()> = (|| {
-            window.set_position(tauri::Position::Physical(PhysicalPosition::new(
-                rect.x, rect.y,
-            )))?;
-            window.set_size(tauri::Size::Physical(PhysicalSize::new(
-                rect.width,
-                rect.height,
-            )))?;
+            let shrinking = window
+                .outer_size()
+                .map(|cur| rect.width < cur.width || rect.height < cur.height)
+                .unwrap_or(false);
 
-            // Re-check outer_size once to absorb cross-DPI monitor transitions cleanly.
-            let actual = window.outer_size()?;
-            if actual.width != rect.width || actual.height != rect.height {
+            if shrinking {
+                // Shrink before repositioning so collapsing on the Right edge never overhangs
+                // beyond the active monitor work area.
+                window.set_size(tauri::Size::Physical(PhysicalSize::new(
+                    rect.width,
+                    rect.height,
+                )))?;
+                window.set_position(tauri::Position::Physical(PhysicalPosition::new(
+                    rect.x, rect.y,
+                )))?;
+            } else {
                 window.set_position(tauri::Position::Physical(PhysicalPosition::new(
                     rect.x, rect.y,
                 )))?;
@@ -845,6 +737,39 @@ impl WindowCoordinator {
                     rect.width,
                     rect.height,
                 )))?;
+            }
+
+            // Re-check both outer_position and outer_size once to absorb cross-DPI or DWM clamping.
+            let actual_pos = window.outer_position()?;
+            let actual_size = window.outer_size()?;
+            if actual_pos.x != rect.x
+                || actual_pos.y != rect.y
+                || actual_size.width != rect.width
+                || actual_size.height != rect.height
+            {
+                window.set_position(tauri::Position::Physical(PhysicalPosition::new(
+                    rect.x, rect.y,
+                )))?;
+                window.set_size(tauri::Size::Physical(PhysicalSize::new(
+                    rect.width,
+                    rect.height,
+                )))?;
+                let retry_pos = window.outer_position()?;
+                let retry_size = window.outer_size()?;
+                if retry_pos.x != rect.x
+                    || retry_pos.y != rect.y
+                    || retry_size.width != rect.width
+                    || retry_size.height != rect.height
+                {
+                    tracing::warn!(
+                        expected = ?rect,
+                        actual_x = retry_pos.x,
+                        actual_y = retry_pos.y,
+                        actual_w = retry_size.width,
+                        actual_h = retry_size.height,
+                        "Window bounds diverged after retry"
+                    );
+                }
             }
             Ok(())
         })();
@@ -929,67 +854,6 @@ pub fn compute_dock_layout(
         expanded_top_logical,
         dock_height_logical,
         handle_offset_y_logical,
-    }
-}
-
-/// Pure clipping region math deriving `dock_rect` and `handle_rect` in physical pixels
-/// from read-back `outer_size`, ensuring zero gap or overshoot.
-#[must_use]
-pub fn compute_expanded_window_region(
-    total_w_phys: u32,
-    total_h_phys: u32,
-    scale_factor: f64,
-    edge: DockEdge,
-    handle_offset_y_logical: f64,
-) -> ExpandedWindowRegionRects {
-    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    };
-    let total_w = (total_w_phys as i32).max(2);
-    let total_h = (total_h_phys as i32).max(1);
-    let dock_w_phys = ((DOCK_PANEL_WIDTH_LOGICAL * scale).round() as i32).clamp(1, total_w - 1);
-    let handle_w_phys = total_w - dock_w_phys;
-
-    let handle_h_phys = ((HANDLE_HEIGHT_LOGICAL * scale).round() as i32).clamp(1, total_h);
-    let max_handle_y = (total_h - handle_h_phys).max(0);
-    let safe_offset = if handle_offset_y_logical.is_finite() {
-        handle_offset_y_logical
-    } else {
-        0.0
-    };
-    let handle_y_phys = ((safe_offset * scale).round() as i32).clamp(0, max_handle_y);
-
-    match edge {
-        DockEdge::Left => ExpandedWindowRegionRects {
-            dock_rect: RegionRect {
-                left: 0,
-                top: 0,
-                right: dock_w_phys,
-                bottom: total_h,
-            },
-            handle_rect: RegionRect {
-                left: dock_w_phys,
-                top: handle_y_phys,
-                right: total_w,
-                bottom: handle_y_phys + handle_h_phys,
-            },
-        },
-        DockEdge::Right => ExpandedWindowRegionRects {
-            handle_rect: RegionRect {
-                left: 0,
-                top: handle_y_phys,
-                right: handle_w_phys,
-                bottom: handle_y_phys + handle_h_phys,
-            },
-            dock_rect: RegionRect {
-                left: handle_w_phys,
-                top: 0,
-                right: total_w,
-                bottom: total_h,
-            },
-        },
     }
 }
 
@@ -1159,7 +1023,7 @@ mod tests {
         );
         assert_eq!(layout.collapsed_rect_phys.width, 24);
         assert_eq!(layout.collapsed_rect_phys.height, 84);
-        assert_eq!(layout.expanded_rect_phys.width, 404);
+        assert_eq!(layout.expanded_rect_phys.width, 380);
     }
 
     #[test]
@@ -1172,86 +1036,44 @@ mod tests {
         };
 
         for scale in [1.0_f64, 1.25_f64, 1.5_f64, 2.0_f64] {
-            let layout = compute_dock_layout(wa, scale, DockEdge::Right, 160.0);
+            let right_layout = compute_dock_layout(wa, scale, DockEdge::Right, 160.0);
             assert_eq!(
-                layout.collapsed_rect_phys.width,
+                right_layout.collapsed_rect_phys.width,
                 (24.0 * scale).round() as u32
             );
             assert_eq!(
-                layout.collapsed_rect_phys.height,
+                right_layout.collapsed_rect_phys.height,
                 (84.0 * scale).round() as u32
             );
             assert_eq!(
-                layout.expanded_rect_phys.width,
-                (404.0 * scale).round() as u32
+                right_layout.expanded_rect_phys.width,
+                (380.0 * scale).round() as u32
             );
             assert_eq!(
-                layout.collapsed_rect_phys.x + layout.collapsed_rect_phys.width as i32,
+                right_layout.collapsed_rect_phys.x + right_layout.collapsed_rect_phys.width as i32,
                 wa.x + wa.width as i32
             );
             assert_eq!(
-                layout.expanded_rect_phys.x + layout.expanded_rect_phys.width as i32,
+                right_layout.expanded_rect_phys.x + right_layout.expanded_rect_phys.width as i32,
                 wa.x + wa.width as i32
             );
-            // Expanded handle position must match collapsed handle screen Y.
+
+            let left_layout = compute_dock_layout(wa, scale, DockEdge::Left, 160.0);
+            assert_eq!(left_layout.collapsed_rect_phys.x, wa.x);
+            assert_eq!(left_layout.expanded_rect_phys.x, wa.x);
+            assert_eq!(
+                left_layout.expanded_rect_phys.width,
+                (380.0 * scale).round() as u32
+            );
+            assert_eq!(
+                left_layout.expanded_rect_phys.height,
+                (left_layout.dock_height_logical * scale).round() as u32
+            );
+
+            // Expanded handle reference Y preserves collapsed handle screen Y.
             let expanded_handle_top_logical =
-                layout.expanded_top_logical + layout.handle_offset_y_logical;
-            assert!((expanded_handle_top_logical - layout.clamped_top_logical).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn computes_expanded_region_rects_for_left_right_scales_fractional_and_extremes() {
-        for edge in [DockEdge::Left, DockEdge::Right] {
-            for scale in [1.0_f64, 1.25_f64, 1.5_f64, 2.0_f64] {
-                // Fractional dock_h (e.g. short work area 516.8 logical px).
-                let dock_h_logical = 516.8_f64;
-                let total_w = (EXPANDED_WIDTH_LOGICAL * scale).round() as u32;
-                let total_h = (dock_h_logical * scale).round() as u32;
-                let expected_dock_w = (DOCK_PANEL_WIDTH_LOGICAL * scale).round() as i32;
-                let expected_handle_h = (HANDLE_HEIGHT_LOGICAL * scale).round() as i32;
-
-                // Extreme 1: handle_offset_y = 0.0
-                let top_extreme =
-                    compute_expanded_window_region(total_w, total_h, scale, edge, 0.0);
-                // Extreme 2: handle_offset_y = dock_h - 84.0
-                let bottom_extreme = compute_expanded_window_region(
-                    total_w,
-                    total_h,
-                    scale,
-                    edge,
-                    dock_h_logical - HANDLE_HEIGHT_LOGICAL,
-                );
-
-                for rgn in [top_extreme, bottom_extreme] {
-                    assert_eq!(rgn.dock_rect.top, 0);
-                    assert_eq!(rgn.dock_rect.bottom, total_h as i32);
-                    assert_eq!(
-                        rgn.handle_rect.bottom - rgn.handle_rect.top,
-                        expected_handle_h
-                    );
-                    assert!(rgn.handle_rect.top >= 0);
-                    assert!(rgn.handle_rect.bottom <= total_h as i32);
-
-                    match edge {
-                        DockEdge::Left => {
-                            assert_eq!(rgn.dock_rect.left, 0);
-                            assert_eq!(rgn.dock_rect.right, expected_dock_w);
-                            assert_eq!(rgn.handle_rect.left, rgn.dock_rect.right);
-                            assert_eq!(rgn.handle_rect.right, total_w as i32);
-                        }
-                        DockEdge::Right => {
-                            assert_eq!(rgn.handle_rect.left, 0);
-                            assert_eq!(rgn.handle_rect.right, rgn.dock_rect.left);
-                            assert_eq!(rgn.dock_rect.right - rgn.dock_rect.left, expected_dock_w);
-                            assert_eq!(rgn.dock_rect.right, total_w as i32);
-                        }
-                    }
-                }
-
-                assert_eq!(top_extreme.handle_rect.top, 0);
-                assert_eq!(bottom_extreme.handle_rect.bottom, total_h as i32);
-            }
+                right_layout.expanded_top_logical + right_layout.handle_offset_y_logical;
+            assert!((expanded_handle_top_logical - right_layout.clamped_top_logical).abs() < 1e-6);
         }
     }
 }

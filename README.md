@@ -2,7 +2,7 @@
 
 Harbor is an ultra-lightweight Windows edge-docking program and game launcher built with **Rust + Tauri v2** on the backend and **React + TypeScript + Tailwind CSS v3 + Lucide Icons** on the frontend.
 
-It docks flush to the left or right edge of the active monitor work area as a compact `24×84` handle, slides out to a `380px` launcher panel (`404px` total window with external handle), auto-discovers Steam games and Start Menu programs, extracts native `.exe`/`.lnk` icons locally, and supports full keyboard navigation and Windows Explorer drag-and-drop pinning.
+It docks flush to the left or right edge of the active monitor work area as a compact `24×84` handle, slides out to a unified `380px` launcher panel, auto-discovers Steam games and Start Menu programs, extracts native `.exe`/`.lnk` icons locally, and supports full keyboard navigation and Windows Explorer drag-and-drop pinning.
 
 ---
 
@@ -56,7 +56,7 @@ harbor/
         ├── models.rs             # DockConfig, DockItem, dismissal keys & icon priority
         ├── scanner.rs            # Steam ACF/VDF discovery & Start Menu .lnk resolution
         ├── win_shell.rs          # Dual COM STA workers, icon extraction, ShellExecuteExW & GDI
-        └── window_manager.rs     # Physical DPI math, SetWindowRgn clipping & edge handle drag
+        └── window_manager.rs     # Physical DPI math, epoch collapse & edge handle drag
 ```
 
 ---

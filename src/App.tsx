@@ -84,6 +84,7 @@ export default function App() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const dockShellRef = useRef<HTMLDivElement>(null);
+  const layoutRef = useRef<WindowLayoutState | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const listScrollRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -127,6 +128,36 @@ export default function App() {
       collapseFallbackTimerRef.current = null;
     }
   }, []);
+
+  const applyLayoutState = useCallback(
+    (nextLayout: WindowLayoutState) => {
+      const prev = layoutRef.current;
+      const becameExpanded = !prev?.expanded && nextLayout.expanded;
+      layoutRef.current = nextLayout;
+      setLayout(nextLayout);
+
+      if (nextLayout.expanded) {
+        pendingCollapseEpochRef.current = null;
+        clearCollapseFallbackTimer();
+        setIsClosing(false);
+        if (becameExpanded || !prev) {
+          setPanelVisible(false);
+          requestAnimationFrame(() => {
+            setPanelVisible(true);
+          });
+        } else {
+          setPanelVisible(true);
+        }
+      } else {
+        pendingCollapseEpochRef.current = null;
+        clearCollapseFallbackTimer();
+        setIsClosing(false);
+        setPanelVisible(false);
+        setContextMenu(null);
+      }
+    },
+    [clearCollapseFallbackTimer],
+  );
 
   const commitCollapseOnce = useCallback(
     async (epoch: number) => {
@@ -219,43 +250,19 @@ export default function App() {
         if (!active) return;
 
         setConfig(initial.config);
-        setLayout(initial.layout);
+        applyLayoutState(initial.layout);
         setMonitors(initial.monitors);
         setHotkeyWarning(initial.hotkey_warning);
         setIsPortable(initial.is_portable);
 
-        if (initial.layout.expanded) {
-          requestAnimationFrame(() => {
-            if (active) setPanelVisible(true);
-          });
-        }
         if (initial.hotkey_warning) {
           pushToast("warning", "Global Hotkey Collision", initial.hotkey_warning);
         }
 
         unlisteners.push(
           await ipc.onLayoutChanged((nextLayout) => {
-            setLayout((prev) => {
-              const becameExpanded = !prev?.expanded && nextLayout.expanded;
-              if (nextLayout.expanded) {
-                pendingCollapseEpochRef.current = null;
-                clearCollapseFallbackTimer();
-                setIsClosing(false);
-                if (becameExpanded || !prev) {
-                  setPanelVisible(false);
-                  requestAnimationFrame(() => {
-                    if (active) setPanelVisible(true);
-                  });
-                } else {
-                  setPanelVisible(true);
-                }
-              } else {
-                setIsClosing(false);
-                setPanelVisible(false);
-                setContextMenu(null);
-              }
-              return nextLayout;
-            });
+            if (!active) return;
+            applyLayoutState(nextLayout);
           }),
         );
 
@@ -268,7 +275,7 @@ export default function App() {
             setPanelVisible(false);
             collapseFallbackTimerRef.current = window.setTimeout(() => {
               void commitCollapseOnce(epoch);
-            }, 180);
+            }, 165);
           }),
         );
 
@@ -337,6 +344,7 @@ export default function App() {
       }
     };
   }, [
+    applyLayoutState,
     clearCollapseFallbackTimer,
     commitCollapseOnce,
     handleUnknownError,
@@ -411,11 +419,11 @@ export default function App() {
     try {
       const nextLayout = await ipc.setEdge(nextEdge);
       setConfig((prev) => (prev ? { ...prev, edge: nextEdge } : prev));
-      setLayout(nextLayout);
+      applyLayoutState(nextLayout);
     } catch (err) {
       handleUnknownError(err);
     }
-  }, [layout, handleUnknownError]);
+  }, [layout, applyLayoutState, handleUnknownError]);
 
   const handleRescan = useCallback(async (): Promise<string[]> => {
     setIsRescanning(true);
@@ -576,11 +584,11 @@ export default function App() {
     async (settings: SettingsUpdate) => {
       const res = await ipc.updateSettings(settings);
       setConfig(res.config);
-      setLayout(res.layout);
+      applyLayoutState(res.layout);
       setHotkeyWarning(res.hotkey_warning);
       pushToast("success", "Settings saved");
     },
-    [pushToast],
+    [applyLayoutState, pushToast],
   );
 
   const handleDismissMissing = useCallback(
@@ -665,9 +673,7 @@ export default function App() {
 
   const getDockHorizontalBounds = useCallback((): DockHorizontalBounds => {
     if (isTauriRuntime()) {
-      return layout?.edge === "Right"
-        ? { minX: 24, maxX: 404 }
-        : { minX: 0, maxX: 380 };
+      return { minX: 0, maxX: 380 };
     }
     const el = dockShellRef.current;
     if (el) {
@@ -677,7 +683,7 @@ export default function App() {
       }
     }
     return { minX: 0, maxX: window.innerWidth };
-  }, [layout?.edge]);
+  }, []);
 
   const contextSubgroup = useMemo(() => {
     if (!contextMenu || !config) {
@@ -741,7 +747,7 @@ export default function App() {
             ? { height: `${Math.round(layout.dock_height)}px` }
             : undefined
         }
-        className={`w-[404px] ${inBrowserPreview ? "" : "h-full"} flex ${isRight ? "flex-row-reverse" : "flex-row"} bg-transparent overflow-hidden`}
+        className={`w-[380px] ${inBrowserPreview ? "" : "h-full"} bg-transparent overflow-hidden`}
       >
         <div
           onTransitionEnd={(e) => {
@@ -754,7 +760,7 @@ export default function App() {
               void commitCollapseOnce(pendingCollapseEpochRef.current);
             }
           }}
-          className={`w-[380px] h-full shrink-0 transition-[transform,opacity] ease-discord ${
+          className={`w-[380px] h-full transition-[transform,opacity] ease-discord ${
             isClosing ? "duration-[150ms]" : "duration-[160ms]"
           } ${slideTransformClass}`}
         >
@@ -858,21 +864,6 @@ export default function App() {
               onRescan={handleRescan}
               onDismissMissing={handleDismissMissing}
               onResetDefaults={handleResetDefaults}
-            />
-          </div>
-        </div>
-
-        <div className="relative w-[24px] h-full shrink-0">
-          <div
-            style={{ top: `${Math.max(0, Math.round(layout.handle_offset_y))}px` }}
-            className="absolute left-0"
-          >
-            <EdgeHandle
-              expanded={true}
-              edge={layout.edge}
-              onExpand={() => void handleExpand()}
-              onCollapse={() => void handleRequestCollapse()}
-              onError={handleUnknownError}
             />
           </div>
         </div>

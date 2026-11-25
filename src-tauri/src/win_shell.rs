@@ -17,10 +17,9 @@ use tokio::sync::{mpsc, oneshot};
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HINSTANCE, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW,
-    MonitorFromPoint, ReleaseDC, SetWindowRgn, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_ERROR,
-    RGN_OR,
+    DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, MonitorFromPoint, ReleaseDC,
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{
@@ -157,39 +156,6 @@ impl Drop for OwnedHbitmap {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             // SAFETY: Releases the owned GDI bitmap handle exactly once after validity check.
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(self.0 .0));
-            }
-        }
-    }
-}
-
-/// RAII wrapper for Win32 `HRGN` calling `DeleteObject` on drop unless disarmed after
-/// handing ownership to `SetWindowRgn`.
-struct OwnedHrgn(HRGN);
-
-impl OwnedHrgn {
-    fn new(handle: HRGN) -> Self {
-        Self(handle)
-    }
-
-    fn as_raw(&self) -> HRGN {
-        self.0
-    }
-
-    fn is_valid(&self) -> bool {
-        !self.0.is_invalid()
-    }
-
-    fn disarm(&mut self) {
-        self.0 = HRGN::default();
-    }
-}
-
-impl Drop for OwnedHrgn {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            // SAFETY: Deletes an owned GDI region handle that was not transferred to `SetWindowRgn`.
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(self.0 .0));
             }
@@ -1162,74 +1128,6 @@ pub fn move_window_no_resize_async(hwnd_raw: isize, x: i32, y: i32) -> AppResult
 pub fn is_window_foreground(hwnd_raw: isize) -> bool {
     // SAFETY: Thread-safe Win32 foreground handle read compared numerically against `hwnd_raw`.
     unsafe { GetForegroundWindow() }.0 as isize == hwnd_raw
-}
-
-/// Applies a combined two-rect window clipping region (`dock_rect` | `handle_rect`) to `hwnd_raw`.
-/// Must be called on the UI/main thread.
-pub fn set_window_region_union(
-    hwnd_raw: isize,
-    dock_rect: (i32, i32, i32, i32),
-    handle_rect: (i32, i32, i32, i32),
-) -> AppResult<()> {
-    // SAFETY: Creates rectangular GDI regions immediately wrapped in RAII `OwnedHrgn` guards.
-    let dock_rgn = OwnedHrgn::new(unsafe {
-        CreateRectRgn(dock_rect.0, dock_rect.1, dock_rect.2, dock_rect.3)
-    });
-    if !dock_rgn.is_valid() {
-        return Err(AppError::Window("CreateRectRgn(dock) returned null".to_owned()));
-    }
-
-    // SAFETY: Creates handle GDI region wrapped in `OwnedHrgn`.
-    let handle_rgn = OwnedHrgn::new(unsafe {
-        CreateRectRgn(handle_rect.0, handle_rect.1, handle_rect.2, handle_rect.3)
-    });
-    if !handle_rgn.is_valid() {
-        return Err(AppError::Window("CreateRectRgn(handle) returned null".to_owned()));
-    }
-
-    // SAFETY: Creates destination GDI region wrapped in `OwnedHrgn`.
-    let mut combined_rgn = OwnedHrgn::new(unsafe { CreateRectRgn(0, 0, 0, 0) });
-    if !combined_rgn.is_valid() {
-        return Err(AppError::Window(
-            "CreateRectRgn(combined) returned null".to_owned(),
-        ));
-    }
-
-    // SAFETY: All three HRGN handles were validated non-null immediately above.
-    let combine_res = unsafe {
-        CombineRgn(
-            Some(combined_rgn.as_raw()),
-            Some(dock_rgn.as_raw()),
-            Some(handle_rgn.as_raw()),
-            RGN_OR,
-        )
-    };
-    if combine_res == RGN_ERROR {
-        return Err(AppError::Window("CombineRgn(RGN_OR) failed".to_owned()));
-    }
-
-    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-    // SAFETY: Executed synchronously on the UI main thread with a valid `HWND` and valid `HRGN`.
-    let set_res = unsafe { SetWindowRgn(hwnd, Some(combined_rgn.as_raw()), true) };
-    if set_res == 0 {
-        return Err(AppError::Window("SetWindowRgn(combined) failed".to_owned()));
-    }
-
-    // Windows owns the HRGN once SetWindowRgn succeeds; disarm RAII deletion.
-    combined_rgn.disarm();
-    Ok(())
-}
-
-/// Clears any active window clipping region so the collapsed `24x84` handle is unclipped.
-/// Must be called on the UI/main thread.
-pub fn clear_window_region(hwnd_raw: isize) -> AppResult<()> {
-    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-    // SAFETY: Executed on the UI main thread; passing `None` clears the HWND region safely.
-    let set_res = unsafe { SetWindowRgn(hwnd, None, true) };
-    if set_res == 0 {
-        tracing::debug!("SetWindowRgn(None) returned 0 (no active region or window closing)");
-    }
-    Ok(())
 }
 
 /// Persists a fatal startup error to the log directory (or temp fallback) and displays a

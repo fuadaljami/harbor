@@ -41,16 +41,13 @@
 7. **Window Geometry, DPI & Flicker-Free Resize / Handle Dragging:**
    - Window config: `decorations: false`, `transparent: true`, `shadow: false`, `resizable: false`, `skipTaskbar: true`, `alwaysOnTop: true`, `visible: false`.
    - Compute window position and size in **physical pixels** from the active monitor's `Monitor::work_area()` (fallback Win32 `GetMonitorInfoW` `rcWork`) and `scale_factor`, rounding physical values consistently. Keep CSS in logical pixels. When moving across monitors with different scale factors: set position first, set size second, read back `outer_size()`, and correct once if needed. Re-resolve monitor and re-clamp `top_position` and `dock_h` before every expand, toggle, hotkey, tray action, and on `WindowEvent::ScaleFactorChanged`.
-   - **Collapsed window:** `24×84` logical px anchored flush to `edge` at `top_position`. Log the collapsed `outer_size()` to verify the click-blocking guarantee.
-   - **Expanded window:** `404 × dock_h` logical px (`380` dock + `24` handle), where `dock_h = min(640.0, work_area_logical_h - 24.0)`.
+   - **Collapsed window:** `24×84` logical px anchored flush to `edge` at `top_position`. Log the collapsed `outer_size()` and `outer_position()` to verify the click-blocking guarantee.
+   - **Expanded window:** `380 × dock_h` logical px flush to `edge`, where `dock_h = min(640.0, work_area_logical_h - 24.0)`. Zero transparent overhang strip (`SetWindowRgn` is never used on the frameless transparent HWND so DWM composition remains intact with zero `WM_NCPAINT` flash).
    - **`top_position`:** handle's top Y relative to `work_area.top` in logical px, clamped to `[8.0, work_area_logical_h - 84.0 - 8.0]`.
    - **Epoch-Safe Expand / Collapse Sequencing:**
      - Track window phase (`Collapsed | Expanded | Collapsing`) and an `AtomicU64` epoch counter.
-     - **Expand sequence:** Compute `desired_dock_top = top_position + 42.0 - (dock_h / 2.0)`, clamped to `expanded_top` in `[8.0, work_area_logical_h - dock_h - 8.0]`, and `handle_offset_y = top_position - expanded_top`. Bump epoch, set phase `Expanded`, resize & position native window to `404 × dock_h` FIRST, activate/focus, record expand timestamp, and return/emit `WindowLayoutState { expanded, edge, dock_height, handle_offset_y, top_position, pinned }` so the frontend plays the `160ms` CSS slide-in.
-     - **Collapse sequence:** Every collapse path routes through `request_collapse_dock`, which bumps the epoch, sets phase `Collapsing`, emits `harbor://request-collapse` (with the epoch), and spawns a `~300ms` fallback timer. Both `commit_collapse_window(epoch)` and the fallback timer are idempotent and only shrink to `24×84` if the epoch and `Collapsing` phase still match. Log collapsed `outer_size()`.
-   - **Phase 5 `SetWindowRgn` Click-Through Clipping:**
-     - **Collapse order:** Call `clear_window_region` (`SetWindowRgn(hwnd, None, true)`) **FIRST**, then shrink the window to `24×84`. Collapsed/startup states never have a region.
-     - **Expand & resize unification:** Route every expanded move/resize (`expand_dock`, `set_edge`, `ScaleFactorChanged`, display re-clamp, external `WindowEvent::Resized` while expanded) through one helper that reads back `outer_size()` and applies `SetWindowRgn` (`CreateRectRgn` + `CombineRgn(RGN_OR)` on `dock_rect` and `handle_rect`, setting `handle_w_phys = total_w_phys - dock_w_phys`) on the main thread (`app.run_on_main_thread`). Disarm the combined `OwnedHrgn` on `SetWindowRgn` success; delete on failure and always delete source `HRGN`s.
+     - **Expand sequence:** Compute `desired_dock_top = top_position + 42.0 - (dock_h / 2.0)`, clamped to `expanded_top` in `[8.0, work_area_logical_h - dock_h - 8.0]`, and `handle_offset_y = top_position - expanded_top`. Bump epoch, set phase `Expanded`, resize & position native window to `380 × dock_h` FIRST, activate/focus, record expand timestamp, and return/emit `WindowLayoutState { expanded, edge, dock_height, handle_offset_y, top_position, pinned }` so the frontend plays the `160ms` CSS slide-in.
+     - **Collapse sequence:** Every collapse path routes through `request_collapse_dock` (idempotent if already `Collapsed` or `Collapsing`), which bumps the epoch, sets phase `Collapsing`, emits `harbor://request-collapse` (with the epoch), and spawns a `~300ms` fallback timer. Both `commit_collapse_window(epoch)` and the fallback timer are idempotent and only shrink to `24×84` flush against the active edge if the epoch and `Collapsing` phase still match. Log collapsed `outer_size()`. Users collapse while expanded via `DockHeader` (`<` / `>` button), outside-blur, `Esc`, tray, or `Alt+Shift+Space`.
    - **Foreground Focus Guarantee:** On hotkey/tray/second-instance/dock expand, verify via Win32 `GetForegroundWindow`; if not foreground, retry focus once after `~50ms` (while still expanded & matching epoch) and log a warning if Windows refuses—never fail expand.
    - **Edge handle vertical drag:** Allowed only while `Collapsed`. Frontend captures pointer (`setPointerCapture`) and calls `start_handle_drag`, recording grab offset (`cursor_y - window_y`) so the handle never jumps under the cursor. A background thread polls `GetCursorPos` (~8ms), clamps Y within the active monitor's physical work area (X locked flush to `edge`), moves via `SetWindowPos(SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)` without synchronously `.join()`ing on the UI thread, and checks `GetAsyncKeyState` (`SM_SWAPBUTTON` -> `VK_RBUTTON` / `VK_LBUTTON`) as a missed-pointer-up safety net. On release, persist `top_position` if moved `>= 5.0` logical px (`< 5px` vertical delta toggles expand/collapse).
    - **Blur guardrails:** Ignore `WindowEvent::Focused(false)` when not `Expanded`, when pinned, when `!config.auto_collapse_on_blur`, when `dialog_open_count > 0`, while dragging, or within a `~250ms` post-expand grace window.
@@ -99,7 +96,7 @@
 
 ## 2. Visual Design System & Design Tokens (Discord-Inspired Architecture)
 
-Compact, dense, legible dark interface sized at `380×640` logical pixels (clamped dynamically to `monitor.work_area.height - 24` on smaller displays or high DPI), plus `24px` edge handle (`404px` expanded width).
+Compact, dense, legible dark interface sized at `380×640` logical pixels when expanded (clamped dynamically to `monitor.work_area.height - 24` on smaller displays or high DPI), and `24×84` logical pixels when collapsed.
 
 ### Color Tokens
 - **Category Rail (Deepest):** `#1E1F22`
@@ -114,8 +111,8 @@ Compact, dense, legible dark interface sized at `380×640` logical pixels (clamp
 - **Typography:** Primary `#F2F3F5`, Secondary `#B5BAC1`, Muted `#949BA4`; Font: `'Inter', 'Segoe UI Variable', 'Segoe UI', sans-serif`
 
 ### Layout & Edge Mirroring
-- **Docked Left (default):** `[56px Category Rail] | [Main Panel + Bottom Control Strip] | [24px Edge Handle on Right when expanded, Left screen edge when collapsed]`
-- **Docked Right (mirrored):** Layout mirrors cleanly (`flex-row-reverse`): the `56px` Category Rail sits flush against the right screen edge, active/hover pill indicators flip to the right side of each rail icon, rail tooltips open to the left, and the collapsed edge handle anchors flush to the right edge with its chevron mirrored.
+- **Docked Left (default):** `[56px Category Rail] | [324px Main Panel + Bottom Control Strip]` flush to left screen edge when expanded; `24×84` Edge Handle flush to left screen edge when collapsed.
+- **Docked Right (mirrored):** Layout mirrors cleanly (`flex-row-reverse`): `[324px Main Panel + Bottom Control Strip] | [56px Category Rail]` flush against the right screen edge when expanded, active/hover pill indicators flip to the right side of each rail icon, rail tooltips open to the left, and the collapsed edge handle anchors flush to the right edge with its chevron mirrored.
 
 ### Component Anatomy
 1. **Category Rail (`56px`, `#1E1F22`):**
